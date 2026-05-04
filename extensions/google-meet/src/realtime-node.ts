@@ -32,6 +32,7 @@ import {
   convertGoogleMeetBridgeAudioForStt,
   convertGoogleMeetTtsAudioForBridge,
   formatGoogleMeetAgentAudioModelLog,
+  formatGoogleMeetAgentTtsResultLog,
   formatGoogleMeetRealtimeVoiceModelLog,
   type GoogleMeetRealtimeEventEntry,
   type GoogleMeetRealtimeTranscriptEntry,
@@ -75,6 +76,7 @@ export async function startNodeAgentAudioBridge(params: {
   fullConfig: OpenClawConfig;
   runtime: PluginRuntime;
   meetingSessionId: string;
+  requesterSessionKey?: string;
   nodeId: string;
   bridgeId: string;
   logger: RuntimeLogger;
@@ -184,6 +186,7 @@ export async function startNodeAgentAudioBridge(params: {
         if (!result.success || !result.audioBuffer || !result.sampleRate) {
           throw new Error(result.error ?? "TTS conversion failed");
         }
+        params.logger.info(formatGoogleMeetAgentTtsResultLog("node agent", result));
         await pushOutputAudio(
           convertGoogleMeetTtsAudioForBridge(
             result.audioBuffer,
@@ -223,6 +226,7 @@ export async function startNodeAgentAudioBridge(params: {
           runtime: params.runtime,
           logger: params.logger,
           meetingSessionId: params.meetingSessionId,
+          requesterSessionKey: params.requesterSessionKey,
           args: {
             question: currentQuestion,
             responseStyle: "Brief, natural spoken answer for a live meeting.",
@@ -371,6 +375,7 @@ export async function startNodeRealtimeAudioBridge(params: {
   fullConfig: OpenClawConfig;
   runtime: PluginRuntime;
   meetingSessionId: string;
+  requesterSessionKey?: string;
   nodeId: string;
   bridgeId: string;
   logger: RuntimeLogger;
@@ -455,6 +460,7 @@ export async function startNodeRealtimeAudioBridge(params: {
           runtime: params.runtime,
           logger: params.logger,
           meetingSessionId: params.meetingSessionId,
+          requesterSessionKey: params.requesterSessionKey,
           args: {
             question: currentQuestion,
             responseStyle: "Brief, natural spoken answer for a live meeting.",
@@ -632,6 +638,7 @@ export async function startNodeRealtimeAudioBridge(params: {
         runtime: params.runtime,
         logger: params.logger,
         meetingSessionId: params.meetingSessionId,
+        requesterSessionKey: params.requesterSessionKey,
         args: event.args,
         transcript,
       })

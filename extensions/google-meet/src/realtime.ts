@@ -473,6 +473,29 @@ export function formatGoogleMeetAgentAudioModelLog(params: {
   ].join(" ");
 }
 
+type GoogleMeetTtsResultLogFields = {
+  provider?: string;
+  providerModel?: string;
+  providerVoice?: string;
+  outputFormat?: string;
+  sampleRate?: number;
+  fallbackFrom?: string;
+};
+
+export function formatGoogleMeetAgentTtsResultLog(
+  prefix: string,
+  result: GoogleMeetTtsResultLogFields,
+): string {
+  return [
+    `[google-meet] ${prefix} TTS: provider=${formatLogValue(result.provider)}`,
+    `model=${formatLogValue(result.providerModel)}`,
+    `voice=${formatLogValue(result.providerVoice)}`,
+    `outputFormat=${formatLogValue(result.outputFormat)}`,
+    `sampleRate=${result.sampleRate ?? "unknown"}`,
+    ...(result.fallbackFrom ? [`fallbackFrom=${formatLogValue(result.fallbackFrom)}`] : []),
+  ].join(" ");
+}
+
 function normalizeGoogleMeetTtsPromptText(text: string | undefined): string | undefined {
   const trimmed = text?.trim();
   if (!trimmed) {
@@ -490,6 +513,7 @@ export async function startCommandAgentAudioBridge(params: {
   fullConfig: OpenClawConfig;
   runtime: PluginRuntime;
   meetingSessionId: string;
+  requesterSessionKey?: string;
   inputCommand: string[];
   outputCommand: string[];
   logger: RuntimeLogger;
@@ -648,6 +672,7 @@ export async function startCommandAgentAudioBridge(params: {
         if (!result.success || !result.audioBuffer || !result.sampleRate) {
           throw new Error(result.error ?? "TTS conversion failed");
         }
+        params.logger.info(formatGoogleMeetAgentTtsResultLog("agent", result));
         writeOutputAudio(
           convertGoogleMeetTtsAudioForBridge(
             result.audioBuffer,
@@ -687,6 +712,7 @@ export async function startCommandAgentAudioBridge(params: {
           runtime: params.runtime,
           logger: params.logger,
           meetingSessionId: params.meetingSessionId,
+          requesterSessionKey: params.requesterSessionKey,
           args: {
             question: currentQuestion,
             responseStyle: "Brief, natural spoken answer for a live meeting.",
@@ -798,6 +824,7 @@ export async function startCommandRealtimeAudioBridge(params: {
   fullConfig: OpenClawConfig;
   runtime: PluginRuntime;
   meetingSessionId: string;
+  requesterSessionKey?: string;
   inputCommand: string[];
   outputCommand: string[];
   logger: RuntimeLogger;
@@ -1084,6 +1111,7 @@ export async function startCommandRealtimeAudioBridge(params: {
           runtime: params.runtime,
           logger: params.logger,
           meetingSessionId: params.meetingSessionId,
+          requesterSessionKey: params.requesterSessionKey,
           args: {
             question: currentQuestion,
             responseStyle: "Brief, natural spoken answer for a live meeting.",
@@ -1184,6 +1212,7 @@ export async function startCommandRealtimeAudioBridge(params: {
         runtime: params.runtime,
         logger: params.logger,
         meetingSessionId: params.meetingSessionId,
+        requesterSessionKey: params.requesterSessionKey,
         args: event.args,
         transcript,
       })
