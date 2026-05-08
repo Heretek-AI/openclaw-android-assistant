@@ -47,7 +47,8 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function expectRecord(value: unknown, label: string): Record<string, unknown> {
-  expect(value, label).toEqual(expect.any(Object));
+  expect(typeof value, label).toBe("object");
+  expect(value, label).not.toBeNull();
   expect(Array.isArray(value), label).toBe(false);
   return value as Record<string, unknown>;
 }
@@ -238,7 +239,7 @@ const COMMAND_PROFILES: Record<string, CommandProfile> = {
     outcome: "success",
     onSuccess: (payload) => {
       const obj = assertObjectPayload("sms.search", payload);
-      expect(typeof obj.count === "number" || typeof obj.count === "string").toBe(true);
+      expect(["number", "string"]).toContain(typeof obj.count);
       expect(Array.isArray(obj.messages)).toBe(true);
     },
   },
