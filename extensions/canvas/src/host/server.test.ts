@@ -260,7 +260,7 @@ describe("canvas host", () => {
     const dir = await createCaseDir();
     const index = path.join(dir, "index.html");
     await fs.writeFile(index, "<html><body>v1</body></html>", "utf8");
-    let resolveReload!: () => void;
+    let resolveReload: (() => void) | undefined;
     const reloadSent = new Promise<void>((resolve) => {
       resolveReload = resolve;
     });
@@ -306,6 +306,9 @@ describe("canvas host", () => {
           send: (message: string) => {
             ws.sent.push(message);
             if (message === "reload") {
+              if (!resolveReload) {
+                throw new Error("Expected Canvas reload resolver to be initialized");
+              }
               resolveReload();
             }
           },
@@ -343,7 +346,6 @@ describe("canvas host", () => {
       );
       expect(upgraded).toBe(true);
       const latestServer = TrackingWebSocketServerClass.latestInstance;
-      expect(latestServer).toBeDefined();
       if (!latestServer) {
         throw new Error("expected Canvas host websocket server");
       }
