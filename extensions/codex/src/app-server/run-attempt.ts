@@ -38,7 +38,7 @@ import {
   type NativeHookRelayEvent,
   type NativeHookRelayRegistrationHandle,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
-import { resolveAgentDir } from "openclaw/plugin-sdk/agent-runtime";
+import { markAuthProfileBlockedUntil, resolveAgentDir } from "openclaw/plugin-sdk/agent-runtime";
 import { emitTrustedDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { pathExists } from "openclaw/plugin-sdk/security-runtime";
 import {
@@ -107,6 +107,7 @@ import {
 import { readRecentCodexRateLimits, rememberCodexRateLimits } from "./rate-limit-cache.js";
 import {
   formatCodexUsageLimitErrorMessage,
+  resolveCodexUsageLimitResetAtMs,
   shouldRefreshCodexRateLimitsForUsageLimitMessage,
 } from "./rate-limits.js";
 import { readCodexAppServerBinding, type CodexAppServerThreadBinding } from "./session-binding.js";
@@ -1147,6 +1148,10 @@ export async function runCodexAppServerAttempt(
     // inside projector.handleNotification still releases the session lane.
     // See openclaw/openclaw#67996.
     const isTurnCompletion = notification.method === "turn/completed" && isCurrentTurnNotification;
+    const isTurnAbortMarker =
+      isCurrentTurnNotification &&
+      isCodexTurnAbortMarkerNotification(notification, { currentPromptText: promptBuild.prompt });
+    const isTurnTerminal = isTurnCompletion || isTurnAbortMarker;
     try {
       await projector.handleNotification(notification);
     } catch (error) {
@@ -1155,7 +1160,10 @@ export async function runCodexAppServerAttempt(
         error,
       });
     } finally {
-      if (isTurnCompletion) {
+      if (isTurnTerminal) {
+        if (isTurnAbortMarker) {
+          projector.markAborted();
+        }
         if (!timedOut && !runAbortController.signal.aborted) {
           await steeringQueue?.flushPending();
         }
@@ -1324,8 +1332,9 @@ export async function runCodexAppServerAttempt(
   const turnStartFailureMessages = [
     ...historyMessages,
     {
-      role: "user",
-      content: [{ type: "text", text: promptBuild.prompt }],
+      role: "user" as const,
+      content: promptBuild.prompt,
+      timestamp: Date.now(),
     },
   ];
 
@@ -1359,7 +1368,7 @@ export async function runCodexAppServerAttempt(
       timeoutMs: appServer.requestTimeoutMs,
       signal: runAbortController.signal,
     });
-    const turnStartErrorMessage = usageLimitError ?? formatErrorMessage(error);
+    const turnStartErrorMessage = usageLimitError?.message ?? formatErrorMessage(error);
     emitCodexAppServerEvent(params, {
       stream: "codex_app_server.lifecycle",
       data: { phase: "turn_start_failed", error: turnStartErrorMessage },
@@ -1410,8 +1419,16 @@ export async function runCodexAppServerAttempt(
     });
     params.abortSignal?.removeEventListener("abort", abortFromUpstream);
     if (usageLimitError) {
-      throw new Error(usageLimitError, {
-        cause: error,
+      await markCodexAuthProfileBlockedFromRateLimits({
+        params,
+        authProfileId: startupAuthProfileId,
+        rateLimits: usageLimitError.rateLimitsForProfile,
+      });
+      return buildCodexTurnStartFailureResult({
+        params,
+        message: usageLimitError.message,
+        messagesSnapshot: turnStartFailureMessages,
+        systemPromptReport,
       });
     }
     throw error;
@@ -1661,6 +1678,75 @@ export async function runCodexAppServerAttempt(
     steeringQueue?.cancel();
     clearActiveEmbeddedRun(params.sessionId, handle, params.sessionKey);
   }
+}
+
+async function markCodexAuthProfileBlockedFromRateLimits(params: {
+  params: EmbeddedRunAttemptParams;
+  authProfileId?: string;
+  rateLimits?: JsonValue;
+}): Promise<void> {
+  const authProfileId = params.authProfileId?.trim();
+  if (!authProfileId || !params.params.authProfileStore) {
+    return;
+  }
+  const blockedUntil = resolveCodexUsageLimitResetAtMs(params.rateLimits);
+  if (!blockedUntil) {
+    return;
+  }
+  try {
+    await markAuthProfileBlockedUntil({
+      store: params.params.authProfileStore,
+      profileId: authProfileId,
+      blockedUntil,
+      source: "codex_rate_limits",
+      agentDir: params.params.agentDir,
+      runId: params.params.runId,
+      modelId: params.params.modelId,
+    });
+  } catch (error) {
+    embeddedAgentLog.debug("failed to mark Codex auth profile blocked from app-server limits", {
+      authProfileId,
+      error: formatErrorMessage(error),
+    });
+  }
+}
+
+function buildCodexTurnStartFailureResult(params: {
+  params: EmbeddedRunAttemptParams;
+  message: string;
+  messagesSnapshot: AgentMessage[];
+  systemPromptReport: ReturnType<typeof buildCodexSystemPromptReport>;
+}): EmbeddedRunAttemptResult {
+  return {
+    aborted: false,
+    externalAbort: false,
+    timedOut: false,
+    idleTimedOut: false,
+    timedOutDuringCompaction: false,
+    timedOutDuringToolExecution: false,
+    promptError: params.message,
+    promptErrorSource: "prompt",
+    sessionIdUsed: params.params.sessionId,
+    messagesSnapshot: params.messagesSnapshot,
+    assistantTexts: [],
+    toolMetas: [],
+    lastAssistant: undefined,
+    didSendViaMessagingTool: false,
+    messagingToolSentTexts: [],
+    messagingToolSentMediaUrls: [],
+    messagingToolSentTargets: [],
+    cloudCodeAssistFormatError: false,
+    replayMetadata: {
+      hadPotentialSideEffects: false,
+      replaySafe: true,
+    },
+    itemLifecycle: {
+      startedCount: 0,
+      completedCount: 0,
+      activeCount: 0,
+    },
+    systemPromptReport: params.systemPromptReport,
+  };
 }
 
 async function handleDynamicToolCallWithTimeout(params: {
@@ -2128,6 +2214,12 @@ type CodexUsageLimitErrorSource = {
   message?: string | null;
   codexErrorInfo?: JsonValue | null;
   rateLimits?: JsonValue;
+  rateLimitsTrustedForProfile?: boolean;
+};
+
+type CodexUsageLimitErrorResult = {
+  message: string;
+  rateLimitsForProfile?: JsonValue;
 };
 
 async function formatCodexTurnStartUsageLimitError(params: {
@@ -2136,8 +2228,8 @@ async function formatCodexTurnStartUsageLimitError(params: {
   pendingNotifications: CodexServerNotification[];
   timeoutMs?: number;
   signal?: AbortSignal;
-}): Promise<string | undefined> {
-  return refreshCodexUsageLimitErrorMessage({
+}): Promise<CodexUsageLimitErrorResult | undefined> {
+  return refreshCodexUsageLimitError({
     client: params.client,
     source: readCodexTurnStartUsageLimitErrorSource(params.error, params.pendingNotifications),
     timeoutMs: params.timeoutMs,
@@ -2151,9 +2243,32 @@ async function refreshCodexUsageLimitErrorMessage(params: {
   timeoutMs?: number;
   signal?: AbortSignal;
 }): Promise<string | undefined> {
+  return (
+    await refreshCodexUsageLimitError({
+      client: params.client,
+      source: params.source,
+      timeoutMs: params.timeoutMs,
+      signal: params.signal,
+    })
+  )?.message;
+}
+
+async function refreshCodexUsageLimitError(params: {
+  client: CodexAppServerClient;
+  source: CodexUsageLimitErrorSource;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<CodexUsageLimitErrorResult | undefined> {
   const initialMessage = formatCodexUsageLimitErrorMessage(params.source);
   if (!shouldRefreshCodexRateLimitsForUsageLimitMessage(initialMessage)) {
-    return initialMessage ?? undefined;
+    return initialMessage
+      ? {
+          message: initialMessage,
+          ...(params.source.rateLimitsTrustedForProfile
+            ? { rateLimitsForProfile: params.source.rateLimits }
+            : {}),
+        }
+      : undefined;
   }
   const rateLimits = await readCodexRateLimitsFromAppServerForUsageLimitError({
     client: params.client,
@@ -2161,14 +2276,22 @@ async function refreshCodexUsageLimitErrorMessage(params: {
     signal: params.signal,
   });
   if (!rateLimits) {
-    return initialMessage;
+    return initialMessage
+      ? {
+          message: initialMessage,
+          ...(params.source.rateLimitsTrustedForProfile
+            ? { rateLimitsForProfile: params.source.rateLimits }
+            : {}),
+        }
+      : undefined;
   }
   const refreshedMessage = formatCodexUsageLimitErrorMessage({
     message: params.source.message,
     codexErrorInfo: params.source.codexErrorInfo,
     rateLimits,
   });
-  return refreshedMessage ?? initialMessage;
+  const message = refreshedMessage ?? initialMessage;
+  return message ? { message, rateLimitsForProfile: rateLimits } : undefined;
 }
 
 async function readCodexRateLimitsFromAppServerForUsageLimitError(params: {
@@ -2206,14 +2329,16 @@ function readCodexTurnStartUsageLimitErrorSource(
   pendingNotifications: CodexServerNotification[],
 ): CodexUsageLimitErrorSource {
   const notificationError = readLatestCodexErrorNotification(pendingNotifications);
+  const notificationRateLimits = readLatestRateLimitNotificationPayload(pendingNotifications);
   const errorPayload = readCodexErrorPayload(error);
+  const rateLimits =
+    notificationRateLimits ?? errorPayload.rateLimits ?? readRecentCodexRateLimits();
   return {
     message: notificationError?.message ?? errorPayload.message ?? formatErrorMessage(error),
     codexErrorInfo: notificationError?.codexErrorInfo ?? errorPayload.codexErrorInfo,
-    rateLimits:
-      readLatestRateLimitNotificationPayload(pendingNotifications) ??
-      errorPayload.rateLimits ??
-      readRecentCodexRateLimits(),
+    rateLimits,
+    rateLimitsTrustedForProfile:
+      notificationRateLimits !== undefined || errorPayload.rateLimits !== undefined,
   };
 }
 
@@ -2264,10 +2389,14 @@ function readCodexErrorPayload(error: unknown): {
     return { message };
   }
   const nestedError = isJsonObject(data.error) ? data.error : data;
+  const rateLimits = nestedError.rateLimits ?? data.rateLimits;
+  if (rateLimits !== undefined) {
+    rememberCodexRateLimits(rateLimits);
+  }
   return {
     message: readString(nestedError, "message") ?? message,
     codexErrorInfo: nestedError.codexErrorInfo,
-    rateLimits: nestedError.rateLimits ?? data.rateLimits,
+    rateLimits,
   };
 }
 
@@ -2342,6 +2471,68 @@ function readNotificationTurnId(record: JsonObject): string | undefined {
 function readNestedTurnId(record: JsonObject): string | undefined {
   const turn = record.turn;
   return isJsonObject(turn) ? readString(turn, "id") : undefined;
+}
+
+const CODEX_TURN_ABORT_MARKER_START = "<turn_aborted>";
+const CODEX_TURN_ABORT_MARKER_END = "</turn_aborted>";
+const CODEX_INTERRUPTED_USER_GUIDANCE =
+  "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+const CODEX_INTERRUPTED_DEVELOPER_GUIDANCE =
+  "The previous turn was interrupted on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+
+function isCodexTurnAbortMarkerNotification(
+  notification: CodexServerNotification,
+  options: { currentPromptText?: string } = {},
+): boolean {
+  if (notification.method !== "rawResponseItem/completed" || !isJsonObject(notification.params)) {
+    return false;
+  }
+  const item = notification.params.item;
+  const role = isJsonObject(item) ? readString(item, "role") : undefined;
+  if (!isJsonObject(item) || (role !== "user" && role !== "developer")) {
+    return false;
+  }
+  const text = extractRawResponseItemText(item).trim();
+  if (role === "user" && text === options.currentPromptText?.trim()) {
+    return false;
+  }
+  const markerBody = readCodexTurnAbortMarkerBody(text);
+  return (
+    markerBody === CODEX_INTERRUPTED_USER_GUIDANCE ||
+    markerBody === CODEX_INTERRUPTED_DEVELOPER_GUIDANCE
+  );
+}
+
+function readCodexTurnAbortMarkerBody(text: string): string | undefined {
+  if (
+    !text.startsWith(CODEX_TURN_ABORT_MARKER_START) ||
+    !text.endsWith(CODEX_TURN_ABORT_MARKER_END)
+  ) {
+    return undefined;
+  }
+  return text
+    .slice(CODEX_TURN_ABORT_MARKER_START.length, -CODEX_TURN_ABORT_MARKER_END.length)
+    .trim();
+}
+
+function extractRawResponseItemText(item: JsonObject): string {
+  const content = item.content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .flatMap((entry) => {
+      if (!isJsonObject(entry)) {
+        return [];
+      }
+      const type = readString(entry, "type");
+      if (type !== "input_text" && type !== "text") {
+        return [];
+      }
+      const text = readString(entry, "text");
+      return text ? [text] : [];
+    })
+    .join("");
 }
 
 function readString(record: JsonObject, key: string): string | undefined {
