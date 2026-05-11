@@ -250,10 +250,12 @@ describe("runEmbeddedPiAgent overflow compaction trigger routing", () => {
     });
 
     expect(mockedEnsureAuthProfileStore).not.toHaveBeenCalled();
-    expect(mockedEnsureAuthProfileStoreWithoutExternalProfiles).toHaveBeenCalledWith(
-      expect.stringMatching(/[/\\]\.openclaw[/\\]agents[/\\]main[/\\]agent$/),
-      { allowKeychainPrompt: false },
-    );
+    const authStoreCall = mockedEnsureAuthProfileStoreWithoutExternalProfiles.mock.calls[0];
+    expect(typeof authStoreCall?.[0]).toBe("string");
+    expect(
+      String(authStoreCall?.[0]).replaceAll("\\", "/").endsWith("/.openclaw/agents/main/agent"),
+    ).toBe(true);
+    expect(authStoreCall?.[1]).toEqual({ allowKeychainPrompt: false });
   });
 
   it("forwards optional attempt params and the runtime plan into one attempt call", async () => {
@@ -463,12 +465,12 @@ describe("runEmbeddedPiAgent overflow compaction trigger routing", () => {
     });
     const harnessParams = pluginRunAttempt.mock.calls[0]?.[0];
     expect(harnessParams?.runtimePlan).toBe(runtimePlan);
-    expect(mockedMarkAuthProfileSuccess).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "openai-codex",
-        profileId: "openai-codex:work",
-      }),
-    );
+    expect(mockedMarkAuthProfileSuccess).toHaveBeenCalledTimes(1);
+    const [[successParams]] = mockedMarkAuthProfileSuccess.mock.calls as unknown as Array<
+      [{ provider?: string; profileId?: string }]
+    >;
+    expect(successParams.provider).toBe("openai-codex");
+    expect(successParams.profileId).toBe("openai-codex:work");
   });
 
   it("keeps auto-selected OpenAI Codex auth profiles for forced codex harness runs", async () => {
