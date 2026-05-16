@@ -6,6 +6,7 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- Security/audit: add `security.audit.suppressions` for intentionally accepted audit findings, keeping suppressed matches out of the active summary while preserving them in JSON output with an active suppression notice. (#76949) Thanks @100menotu001.
 - Control UI: show provider quota usage in the Overview card and Chat header, and recover stale Chat in-progress state after missed terminal events. (#82647)
 - Providers/xAI: add xAI Grok OAuth login for SuperGrok subscribers, letting `xai/*` models and xAI media/tool providers authenticate without `XAI_API_KEY`.
 - CLI/cron: add `openclaw cron run --wait` with timeout and poll interval controls, plus exact `cron.runs --run-id` filtering so automation can block on one queued manual run. (#81929) Thanks @ificator.
@@ -14,6 +15,7 @@ Docs: https://docs.openclaw.ai
 - Agents/skills: cache hydrated `resolvedSkills` across warm gateway turns while keying reuse by the redacted effective config, reducing redundant skill snapshot rebuilds without crossing config-gated skill boundaries. (#81451) Thanks @solodmd.
 - Telegram/group chat: add opt-in `messages.groupChat.ambientTurns: "room_event"` handling so always-on ambient chatter can run as quiet room context and speak visibly only via the message tool. (#81317) Thanks @obviyus.
 - Codex/context engines: bind thread-bootstrap projection epochs to Codex app-server threads, carry redacted tool-result context into fresh threads, and rotate backend threads when projection state changes. (#82351) Thanks @jalehman.
+- Agents/media: run `image_generate` through the shared async media-generation task lifecycle in session-backed chats, with task status, duplicate guarding, and message-tool completion delivery matching music/video.
 - Gateway: add opt-in restart trace logs for restart signal, active-work drain, close, next-start, ready, and memory spans. (#82396) Thanks @samzong.
 - Gateway/performance: split startup benchmark HTTP-listen timing from full gateway-ready timing and add post-bind plugin and sidecar diagnostics to restart-readiness traces. (#82603) Thanks @samzong.
 - QA-Lab: add a deterministic local personal-agent scenario pack covering reminders, threaded replies, scoped memory recall, redaction, and safe tool followthrough. (#78219) Thanks @iFiras-Max1.
@@ -22,11 +24,21 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- Channels/stream previews: contain rejected background draft-stream flushes so preview send failures do not surface as fatal unhandled rejections. Fixes #82712. (#82713) Thanks @coygeek.
+- Providers/OpenAI Codex: include base `gpt-5.5` and `gpt-5.4` reasoning metadata in the bundled Codex catalog so `/think xhigh` remains available for those models. Fixes #82744.
+- Agents/edit tool: honor `file_path` and related path aliases when resolving edit-recovery targets, so post-write errors no longer surface false edit failures after the file actually changed. Fixes #81909. Thanks @giodl73-repo.
+- QQBot: treat only explicit truthy `QQBOT_DEBUG` values as enabling debug logs, so false-like values such as `0` no longer expose debug output. Fixes #82644. (#82697) Thanks @leno23.
+- Agents/session_status: resolve implicit no-arg status lookups against the live run session, so `/think` changes report the current thinking level instead of stale sandbox state. Fixes #82669. (#82696) Thanks @leno23.
+- Discord: keep progress drafts visible for message-tool-only guild replies under the default coding tool profile. Fixes #82747. Thanks @eliranwong.
 - Gateway/diagnostics: add opt-in critical memory pressure stability snapshots with gateway logs, V8 heap, cgroup, active-resource, and redacted large session-file evidence. Fixes #82518.
+- Doctor/Gateway: avoid treating unrelated macOS LaunchAgents as legacy gateways just because their environment values mention old checkout paths.
 - CLI/setup: collapse raw gateway config keys in existing-config summaries into friendly `Model` and `Gateway` rows.
 - CLI/config: show concise human config-write output with an indented backup path instead of printing checksum-heavy overwrite audit details by default.
 - CLI/docs: call the canonical lowercase docs MCP search tool and surface MCP errors instead of returning empty search results. Fixes #82702. (#82704) Thanks @hclsys.
 - QA-Lab: ignore heartbeat-only operational transcripts when capturing runtime parity cells so background checks cannot replace the scenario reply. (#80323) Thanks @100yenadmin.
+- Gateway/exec approvals: wait for accepted async approval follow-up runs instead of direct-fallback sending duplicate completions when retries use different nonce keys. Fixes #82711. (#82717) Thanks @udaymanish6.
+- Agents/subagents: mark completed subagent handoffs as ready for parent review so requester agents verify results and continue required follow-up work before reporting done. (#82724) Thanks @100menotu001.
+- QA-Lab: validate Capture saved views loaded from browser storage so malformed local state cannot poison Capture inspector filters or layout controls. (#77722) Thanks @AsaZhou923.
 - CLI/config: add `--dry-run` support to `openclaw config unset`, with `--json` output and allow-exec validation parity with `config set`/`config patch` dry-run handling. (#81895) Thanks @giodl73-repo.
 - Memory-core: retry disabled dreaming cron cleanup until cron is available after startup, so persisted managed dreaming jobs are removed after restart. Fixes #82383. (#82389) Thanks @neeravmakwana.
 - Providers/xAI: keep retired Grok 3, Grok 4 Fast, Grok 4.1 Fast, and Grok Code slugs out of model pickers while preserving compatibility resolution for existing configs.
@@ -54,6 +66,7 @@ Docs: https://docs.openclaw.ai
 - Agents/OpenAI Responses: log redacted diagnostics for detail-less `response.failed` events while preserving failed response ids, so operators can correlate provider-side failures. Fixes #82558.
 - Agents/OpenRouter: strip non-replayable Anthropic/xAI reasoning provenance tags from follow-up requests, preventing poisoned thinking signatures from breaking second turns. Fixes #82335. (#82380) Thanks @hclsys.
 - Providers/xAI: send configurable reasoning effort only for Grok 4.3, preserving xAI's default low reasoning while omitting unsupported controls for Grok 4.20 reasoning models. (#81227) Thanks @jason-allen-oneal.
+- Image generation: raise Google, OpenRouter, and xAI hosted provider default timeouts to 180 seconds so slow hosted image requests have more time to complete. (#75337)
 - Agents/auth: redact OAuth refresh failure causes against in-memory, attempted, and reloaded credentials before generic token masking while ensuring failed ACP dispatch cleanup closes initialized runtimes.
 - Google/Gemini CLI OAuth: add provider-owned refresh support for `google-gemini-cli` so expired Gemini CLI tokens refresh in OpenClaw instead of falling through to the generic unknown-provider path. Fixes #42541. Thanks @jason-allen-oneal.
 - Telegram: cache successful startup bot identity by account and token fingerprint for up to 24 hours, so restarts can skip redundant `getMe` probes during Telegram API slow periods without permanently pinning renamed bots. Refs #82525.
