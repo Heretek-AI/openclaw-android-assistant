@@ -760,6 +760,57 @@ describe("runCodexAppServerAttempt", () => {
     expect(testing.resolveCodexDynamicToolsLoading({}, privateQaCodexEnv)).toBe("direct");
   });
 
+  it("limits Codex memory flush runs to managed read and write tools", async () => {
+    const factoryOptions: unknown[] = [];
+    testing.setOpenClawCodingToolsFactoryForTests((options) => {
+      factoryOptions.push(options);
+      return [
+        createRuntimeDynamicTool("read"),
+        createRuntimeDynamicTool("write"),
+        createRuntimeDynamicTool("exec"),
+        createRuntimeDynamicTool("process"),
+        createRuntimeDynamicTool("apply_patch"),
+        createRuntimeDynamicTool("message"),
+      ];
+    });
+    const sessionFile = path.join(tempDir, "session.jsonl");
+    const workspaceDir = path.join(tempDir, "workspace");
+    const params = createParams(sessionFile, workspaceDir);
+    params.disableTools = false;
+    params.runtimePlan = createCodexRuntimePlanFixture();
+    params.trigger = "memory";
+    params.memoryFlushWritePath = "memory/2026-05-22.md";
+    const sandboxSessionKey = params.sessionKey;
+    if (!sandboxSessionKey) {
+      throw new Error("createParams must provide a sessionKey for Codex dynamic tool tests.");
+    }
+
+    const nativeToolSurfaceEnabled = testing.shouldEnableCodexAppServerNativeToolSurface(params, {
+      enabled: true,
+      backendId: "docker",
+    } as never);
+    const tools = await testing.buildDynamicTools({
+      params,
+      resolvedWorkspace: workspaceDir,
+      effectiveWorkspace: workspaceDir,
+      sandboxSessionKey,
+      sandbox: { enabled: true, backendId: "docker" } as never,
+      nativeToolSurfaceEnabled,
+      runAbortController: new AbortController(),
+      sessionAgentId: "main",
+      pluginConfig: {},
+      onYieldDetected: () => undefined,
+    });
+
+    expect(nativeToolSurfaceEnabled).toBe(false);
+    expect(factoryOptions).toHaveLength(1);
+    expect(factoryOptions[0]).toMatchObject({
+      trigger: "memory",
+      memoryFlushWritePath: "memory/2026-05-22.md",
+    });
+    expect(tools.map((tool) => tool.name)).toEqual(["read", "write"]);
+  });
+
   it("exposes OpenClaw sandbox shell tools under distinct names for non-Docker sandbox backends", async () => {
     testing.setOpenClawCodingToolsFactoryForTests(() => [
       createRuntimeDynamicTool("read"),
@@ -4865,10 +4916,18 @@ describe("runCodexAppServerAttempt", () => {
       aborted: result.aborted,
       timedOut: result.timedOut,
       promptError: result.promptError,
+      codexAppServerFailure: result.codexAppServerFailure,
     }).toEqual({
       aborted: true,
       timedOut: true,
       promptError: "codex app-server turn idle timed out waiting for turn/completed",
+      codexAppServerFailure: {
+        kind: "turn_completion_idle_timeout",
+        transport: "stdio",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        replaySafe: true,
+      },
     });
     await vi.waitFor(
       () =>
@@ -7767,6 +7826,13 @@ describe("runCodexAppServerAttempt", () => {
     expect(result.promptError).toBe("codex app-server client closed before turn completed");
     expect(result.aborted).toBe(false);
     expect(result.timedOut).toBe(false);
+    expect(result.codexAppServerFailure).toEqual({
+      kind: "client_closed_before_turn_completed",
+      transport: "stdio",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      replaySafe: true,
+    });
   });
 
   it("does not fail a turn when the client closes after terminal completion is queued", async () => {

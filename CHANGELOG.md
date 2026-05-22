@@ -6,7 +6,9 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- Maintainer skills: add `openclaw-landable-bug-sweep` for producing five small, reviewed, CI-green OpenClaw bugfix PRs from issue/PR sweeps.
 - Discord: allow configuring a bounded `agentComponents.ttlMs` callback registry lifetime for long-running component workflows, with per-account overrides and a 24-hour cap. (#84189) Thanks @100menotu001.
+- xAI/Grok: reuse xAI OAuth auth profiles for Grok `web_search`, thread active-agent auth through web search, add Grok model aliases, and let media providers declare default operation timeouts. (#85182) Thanks @fuller-stack-dev.
 - Plugin SDK: add row-level session workflow helpers and deprecate `loadSessionStore` so plugins can read and patch sessions without depending on the legacy whole-store shape. (#84693) Thanks @efpiva.
 - Gateway/plugins: reuse a compatible Gateway startup plugin registry during dispatch so safe plugin dispatches avoid redundant registry loading. (#84324) Thanks @ai-hpc.
 - Plugins/SDK: add a general `embeddingProviders` capability contract and registration API so embeddings can become a reusable provider surface outside memory-specific adapters.
@@ -24,6 +26,11 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- fix(integrations): enforce channel read target allowlists [AI]. (#84982) Thanks @pgondhi987.
+- Gateway CLI: surface local post-challenge connect assembly failures immediately instead of waiting for the wrapper timeout. Fixes #68944. (#85253) Thanks @samzong.
+- Agents/exec: treat denied exec approvals as terminal instead of feeding them back into agent follow-up work, and recognize Chinese stop phrases in abort handling. Fixes #69386. (#85194) Thanks @samzong.
+- CLI/agents: abort accepted Gateway-backed `openclaw agent` runs on SIGINT/SIGTERM so cron and supervisor timeouts do not leave remote agent work alive. Fixes #71710. (#84381) Thanks @Kaspre.
+- Codex app-server: retry replay-safe stdio client-close turns once using structured failure metadata, while surfacing idle `turn/completed` timeouts instead of blindly replaying active shared-server turns. Thanks @VACInc.
 - Codex app-server: reject command overrides that embed Node or package-manager arguments and point users to `appServer.args`, so Windows startup avoids shell parsing failures. (#84417) Thanks @TurboTheTurtle.
 - Agents/Copilot: drop unsafe GitHub Copilot Responses reasoning replay items before send so Telegram direct sessions no longer fail on overlong replay IDs. Fixes #85197. (#85198) Thanks @galiniliev.
 - UI: add accessible tooltips to the topbar color-mode buttons so System, Light, and Dark choices are labeled on hover and focus. (#85227) Thanks @amknight.
@@ -38,9 +45,11 @@ Docs: https://docs.openclaw.ai
 - Channels/message tool: resolve configured external channel plugins during in-agent channel selection, so `openclaw agent --local` message-tool sends no longer report an available channel as unavailable. (#85022) Thanks @Kaspre.
 - Agents/subagents: surface blocked child-run completions as errors instead of successful subagent finishes. (#80886) Thanks @TurboTheTurtle.
 - Agents/Pi: treat accepted embedded `sessions_spawn` child-session handoffs as terminal progress so parent turns no longer report false non-deliverable failures. (#85054) Thanks @samzong.
+- CLI/models: resolve `openclaw models set` aliases from the runtime config while keeping authored aliases ahead of runtime-only defaults. (#83262) Thanks @IWhatsskill.
 - WhatsApp: update Baileys to `7.0.0-rc13` and drop the obsolete logger type patch.
 - Install/update: reject OpenClaw GitHub source package targets early and point moving-main users at the dev/git install path instead of the broken npm source-install flow.
 - Gateway: mirror successful same-source message-tool sends into session transcripts so delivered replies stay in later history/context. (#84837) Thanks @iFiras-Max1.
+- Media generation: keep image, music, and video completion delivery from duplicating or losing task ownership when generated media finishes through active session replies. (#84006) Thanks @fuller-stack-dev.
 - Infra/json: retry transient `File changed during read` races while loading JSON state so config and state reads recover instead of failing the turn. (#84285)
 - Plugins/providers: fail closed for workspace provider plugins during setup-mode discovery unless explicitly trusted, preventing untrusted workspace plugin code from running during provider setup. (#81069) Thanks @mmaps.
 - Providers/Ollama: resolve configured Ollama Cloud `OLLAMA_API_KEY` markers to the real discovery key so cloud provider entries keep authenticated model catalog access. (#85037)
@@ -241,6 +250,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- Agents/exec approvals: return approved WebChat gateway exec output inline after native approval instead of leaving the model waiting for an async follow-up. (#82019) Thanks @Zac-W.
 - CLI/node: reject invalid explicit `node run --port` values instead of silently falling back to the configured or default port. Fixes #83923. Thanks @davinci282828.
 - CLI: reject explicit port numbers above 65535 before they reach Gateway or Node bind paths. Fixes #83900. (#84008) Thanks @hclsys.
 - Codex app-server: preserve plugin tool auth profiles when Codex owns model transport so OpenClaw dynamic tools can resolve their provider credentials. (#83603) Thanks @rubencu.

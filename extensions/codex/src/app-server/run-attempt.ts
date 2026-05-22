@@ -217,6 +217,7 @@ const CODEX_NATIVE_SANDBOX_TOOL_REQUIREMENTS = [
   "edit",
   "apply_patch",
 ] as const;
+const CODEX_MEMORY_FLUSH_DYNAMIC_TOOL_ALLOW = new Set(["read", "write"]);
 const CODEX_NATIVE_PROJECT_DOC_BASENAMES = new Set(["agents.md"]);
 const CODEX_WORKSPACE_DEVELOPER_CONTEXT_BASENAMES = new Set([
   "identity.md",
@@ -290,6 +291,31 @@ function collectTerminalAssistantText(result: EmbeddedRunAttemptResult): string 
 
 function hasCodexAppServerPotentialSideEffectEvidence(result: EmbeddedRunAttemptResult): boolean {
   return result.replayMetadata.hadPotentialSideEffects;
+}
+
+function resolveCodexAppServerReplayBlockedReason(
+  result: EmbeddedRunAttemptResult,
+):
+  | NonNullable<EmbeddedRunAttemptResult["codexAppServerFailure"]>["replayBlockedReason"]
+  | undefined {
+  if (result.replayMetadata.hadPotentialSideEffects) {
+    return "potential_side_effect";
+  }
+  if (result.assistantTexts.some((text) => text.trim().length > 0)) {
+    return "assistant_output";
+  }
+  if (
+    result.toolMetas.length > 0 ||
+    result.clientToolCalls ||
+    result.lastToolError ||
+    result.didSendDeterministicApprovalPrompt
+  ) {
+    return "tool_activity";
+  }
+  if (result.itemLifecycle.startedCount > 0 || result.itemLifecycle.activeCount > 0) {
+    return "active_item";
+  }
+  return undefined;
 }
 
 type CodexSteeringQueueOptions = {
@@ -2804,6 +2830,14 @@ export async function runCodexAppServerAttempt(
     }
     const finalPromptErrorSource =
       timedOut || clientClosedPromptError ? "prompt" : result.promptErrorSource;
+    const codexAppServerFailureKind = clientClosedPromptError
+      ? "client_closed_before_turn_completed"
+      : turnCompletionIdleTimedOut
+        ? "turn_completion_idle_timeout"
+        : undefined;
+    const codexAppServerReplayBlockedReason = codexAppServerFailureKind
+      ? resolveCodexAppServerReplayBlockedReason(result)
+      : undefined;
     const completionIdleTimeoutHadPotentialSideEffects =
       hasCodexAppServerPotentialSideEffectEvidence(result);
     const promptTimeoutOutcome =
@@ -2928,6 +2962,20 @@ export async function runCodexAppServerAttempt(
       aborted: finalAborted,
       promptError: finalPromptError,
       promptErrorSource: finalPromptErrorSource,
+      ...(codexAppServerFailureKind
+        ? {
+            codexAppServerFailure: {
+              kind: codexAppServerFailureKind,
+              transport: appServer.start.transport,
+              threadId: thread.threadId,
+              turnId: activeTurnId,
+              replaySafe: codexAppServerReplayBlockedReason === undefined,
+              ...(codexAppServerReplayBlockedReason
+                ? { replayBlockedReason: codexAppServerReplayBlockedReason }
+                : {}),
+            },
+          }
+        : {}),
       ...(promptTimeoutOutcome ? { promptTimeoutOutcome } : {}),
       systemPromptReport,
     };
@@ -3601,7 +3649,9 @@ async function buildDynamicTools(input: DynamicToolBuildParams) {
     },
   });
   const codexFilteredTools = addSandboxShellDynamicToolsIfAvailable(
-    filterCodexDynamicTools(allTools, input.pluginConfig),
+    isCodexMemoryFlushRun(params)
+      ? filterCodexMemoryFlushDynamicTools(allTools)
+      : filterCodexDynamicTools(allTools, input.pluginConfig),
     allTools,
     input,
   );
@@ -3647,6 +3697,9 @@ function shouldEnableCodexAppServerNativeToolSurface(
   sandbox?: OpenClawSandboxContext,
   options: { sandboxExecServerEnabled?: boolean } = {},
 ): boolean {
+  if (isCodexMemoryFlushRun(params)) {
+    return false;
+  }
   const toolsAllow = includeForcedMessageToolAllow(params.toolsAllow, params);
   if (toolsAllow === undefined) {
     return canCodexAppServerNativeToolSurfaceHonorSandbox(sandbox, options);
@@ -3686,6 +3739,18 @@ function canSandboxToolPolicyExposeCodexNativeToolSurface(sandbox: {
 }): boolean {
   return CODEX_NATIVE_SANDBOX_TOOL_REQUIREMENTS.every((toolName) =>
     isToolAllowed(sandbox.tools, toolName),
+  );
+}
+
+function isCodexMemoryFlushRun(
+  params?: Pick<EmbeddedRunAttemptParams, "trigger" | "memoryFlushWritePath">,
+): boolean {
+  return params?.trigger === "memory" && Boolean(params.memoryFlushWritePath?.trim());
+}
+
+function filterCodexMemoryFlushDynamicTools<T extends { name: string }>(tools: T[]): T[] {
+  return tools.filter((tool) =>
+    CODEX_MEMORY_FLUSH_DYNAMIC_TOOL_ALLOW.has(normalizeCodexDynamicToolName(tool.name)),
   );
 }
 
@@ -3796,6 +3861,9 @@ function addSandboxShellDynamicToolsIfAvailable(
 }
 
 function shouldExposeSandboxExecDynamicTool(input: DynamicToolBuildParams): boolean {
+  if (isCodexMemoryFlushRun(input.params)) {
+    return false;
+  }
   const backendId = input.sandbox?.enabled ? input.sandbox.backendId.trim().toLowerCase() : "";
   return Boolean(backendId && input.nativeToolSurfaceEnabled === false);
 }
