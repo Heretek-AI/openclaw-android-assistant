@@ -9,7 +9,6 @@ import {
   onAgentEvent,
   queueAgentHarnessMessage,
   resetAgentEventsForTest,
-  wrapToolWithBeforeToolCallHook,
   type AgentEventPayload,
   type EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -96,6 +95,11 @@ import {
 let tempDir: string;
 let codexAppServerClientFactoryForTest: CodexAppServerClientFactory | undefined;
 const fastWait = { interval: 1, timeout: 5_000 } as const;
+const appServerHarnessWait = { interval: 1, timeout: 120_000 } as const;
+const activeAppServerAttemptsForTest = new Set<{
+  abortController?: AbortController;
+  promise: Promise<unknown>;
+}>();
 
 type RunCodexAppServerAttemptOptions = NonNullable<
   Parameters<typeof runCodexAppServerAttemptImpl>[1]
@@ -150,10 +154,38 @@ function runCodexAppServerAttempt(
   options: RunCodexAppServerAttemptOptions = {},
 ) {
   const clientFactory = options.clientFactory ?? codexAppServerClientFactoryForTest;
-  return runCodexAppServerAttemptImpl(
-    params,
+  const abortController = params.abortSignal ? undefined : new AbortController();
+  const trackedParams = abortController
+    ? ({ ...params, abortSignal: abortController.signal } as EmbeddedRunAttemptParams)
+    : params;
+  const entry = {
+    abortController,
+    promise: undefined as unknown as Promise<unknown>,
+  };
+  const promise = runCodexAppServerAttemptImpl(
+    trackedParams,
     clientFactory ? { ...options, clientFactory } : options,
-  );
+  ).finally(() => {
+    activeAppServerAttemptsForTest.delete(entry);
+  });
+  entry.promise = promise;
+  activeAppServerAttemptsForTest.add(entry);
+  promise.catch(() => undefined);
+  return promise;
+}
+
+async function drainActiveAppServerAttemptsForTest(): Promise<void> {
+  const attempts = [...activeAppServerAttemptsForTest];
+  if (attempts.length === 0) {
+    return;
+  }
+  for (const attempt of attempts) {
+    attempt.abortController?.abort("test_cleanup");
+  }
+  await Promise.race([
+    Promise.allSettled(attempts.map((attempt) => attempt.promise)),
+    new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+  ]);
 }
 
 function createParams(sessionFile: string, workspaceDir: string): EmbeddedRunAttemptParams {
@@ -367,7 +399,7 @@ function createAppServerHarness(
   const waitForServerRequestHandler = async () => {
     await vi.waitFor(() => expect(handleServerRequest).toBeTypeOf("function"), {
       interval: 1,
-      timeout: 30_000,
+      timeout: appServerHarnessWait.timeout,
     });
     return handleServerRequest!;
   };
@@ -375,7 +407,7 @@ function createAppServerHarness(
   return {
     request,
     requests,
-    async waitForMethod(method: string, timeoutMs = 30_000) {
+    async waitForMethod(method: string, timeoutMs = appServerHarnessWait.timeout) {
       await vi.waitFor(
         () => {
           if (!requests.some((entry) => entry.method === method)) {
@@ -837,6 +869,8 @@ describe("runCodexAppServerAttempt", () => {
   });
 
   afterEach(async () => {
+    await drainActiveAppServerAttemptsForTest();
+    await closeCodexSandboxExecServersForTests();
     resetCodexAppServerClientFactoryForTest();
     testing.resetOpenClawCodingToolsFactoryForTests();
     resetCodexRateLimitCacheForTests();
@@ -3255,404 +3289,102 @@ describe("runCodexAppServerAttempt", () => {
     ).toBe(false);
   });
 
-  it("keeps mixed dynamic tool batches running after one terminal result", async () => {
-    const harness = createStartedThreadHarness();
-    let markEchoStarted: (() => void) | undefined;
-    const echoStarted = new Promise<void>((resolve) => {
-      markEchoStarted = resolve;
-    });
-    let releaseEcho: (() => void) | undefined;
-    const echoBlocked = new Promise<void>((resolve) => {
-      releaseEcho = resolve;
-    });
-    testing.setOpenClawCodingToolsFactoryForTests(() => [
-      {
-        ...createRuntimeDynamicTool("image_generate"),
-        execute: vi.fn(async () => ({
-          content: [{ type: "text" as const, text: "Background task started." }],
-          details: { async: true, status: "started", taskId: "task-1" },
-          terminate: true,
-        })),
-      },
-      {
-        ...createRuntimeDynamicTool("echo"),
-        execute: vi.fn(async () => {
-          markEchoStarted?.();
-          await echoBlocked;
-          return {
-            content: [{ type: "text" as const, text: "echo done" }],
-            details: {},
-          };
-        }),
-      },
-    ]);
-
-    const params = createParams(
-      path.join(tempDir, "session.jsonl"),
-      path.join(tempDir, "workspace"),
-    );
-    params.disableTools = false;
-    params.runtimePlan = createCodexRuntimePlanFixture();
-
-    const run = runCodexAppServerAttempt(params);
-    await harness.waitForMethod("turn/start");
-
-    const echoRequest = harness.handleServerRequest({
-      id: "request-echo",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-echo-1",
-        namespace: null,
-        tool: "echo",
-        arguments: {},
-      },
-    });
-    await echoStarted;
-
-    const imageResult = await harness.handleServerRequest({
-      id: "request-image-generate",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-image-1",
-        namespace: null,
-        tool: "image_generate",
-        arguments: { prompt: "lighthouse" },
-      },
-    });
-    expect(imageResult).toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "Background task started." }],
-    });
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-
-    releaseEcho?.();
-    await expect(echoRequest).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "echo done" }],
-    });
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-
-    await harness.notify({
-      method: "item/completed",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        completedAtMs: Date.now(),
-        item: {
-          type: "dynamicToolCall",
-          id: "call-echo-1",
-          namespace: null,
-          tool: "echo",
-          arguments: {},
-          status: "completed",
-          contentItems: [{ type: "inputText", text: "echo done" }],
-          success: true,
-          durationMs: 1,
-        },
-      },
-    });
-
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-
-    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    const result = await run;
-    expect(result.timedOut).toBe(false);
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-  });
-
-  it("does not terminal-release when a parallel non-terminal dynamic tool finished first", async () => {
-    const harness = createStartedThreadHarness();
-    let markImageStarted: (() => void) | undefined;
-    const imageStarted = new Promise<void>((resolve) => {
-      markImageStarted = resolve;
-    });
-    let releaseImage: (() => void) | undefined;
-    const imageBlocked = new Promise<void>((resolve) => {
-      releaseImage = resolve;
-    });
-    testing.setOpenClawCodingToolsFactoryForTests(() => [
-      {
-        ...createRuntimeDynamicTool("echo"),
-        execute: vi.fn(async () => ({
-          content: [{ type: "text" as const, text: "echo done" }],
-          details: {},
-        })),
-      },
-      {
-        ...createRuntimeDynamicTool("image_generate"),
-        execute: vi.fn(async () => {
-          markImageStarted?.();
-          await imageBlocked;
-          return {
-            content: [{ type: "text" as const, text: "Background task started." }],
-            details: { async: true, status: "started", taskId: "task-1" },
-            terminate: true,
-          };
-        }),
-      },
-    ]);
-
-    const params = createParams(
-      path.join(tempDir, "session.jsonl"),
-      path.join(tempDir, "workspace"),
-    );
-    params.disableTools = false;
-    params.runtimePlan = createCodexRuntimePlanFixture();
-
-    const run = runCodexAppServerAttempt(params);
-    await harness.waitForMethod("turn/start");
-
-    const imageRequest = harness.handleServerRequest({
-      id: "request-image-generate",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-image-1",
-        namespace: null,
-        tool: "image_generate",
-        arguments: { prompt: "lighthouse" },
-      },
-    });
-    await imageStarted;
-    await expect(
-      harness.handleServerRequest({
-        id: "request-echo",
-        method: "item/tool/call",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          callId: "call-echo-1",
-          namespace: null,
-          tool: "echo",
-          arguments: {},
-        },
-      }),
-    ).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "echo done" }],
-    });
-    await harness.notify({
-      method: "item/completed",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        completedAtMs: Date.now(),
-        item: {
-          type: "dynamicToolCall",
-          id: "call-echo-1",
-          namespace: null,
-          tool: "echo",
-          arguments: {},
-          status: "completed",
-          contentItems: [{ type: "inputText", text: "echo done" }],
-          success: true,
-          durationMs: 1,
-        },
-      },
-    });
-    releaseImage?.();
-    await expect(imageRequest).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "Background task started." }],
-    });
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-
-    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    const result = await run;
-    expect(result.timedOut).toBe(false);
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-  });
-
-  it("terminal-releases after a prior non-terminal dynamic tool batch is closed", async () => {
-    const harness = createStartedThreadHarness();
-    testing.setOpenClawCodingToolsFactoryForTests(() => [
-      {
-        ...createRuntimeDynamicTool("echo"),
-        execute: vi.fn(async () => ({
-          content: [{ type: "text" as const, text: "echo done" }],
-          details: {},
-        })),
-      },
-      {
-        ...createRuntimeDynamicTool("image_generate"),
-        execute: vi.fn(async () => ({
-          content: [{ type: "text" as const, text: "Background task started." }],
-          details: { async: true, status: "started", taskId: "task-1" },
-          terminate: true,
-        })),
-      },
-    ]);
-
-    const params = createParams(
-      path.join(tempDir, "session.jsonl"),
-      path.join(tempDir, "workspace"),
-    );
-    params.disableTools = false;
-    params.runtimePlan = createCodexRuntimePlanFixture();
-
-    const run = runCodexAppServerAttempt(params);
-    await harness.waitForMethod("turn/start");
-
-    await expect(
-      harness.handleServerRequest({
-        id: "request-echo",
-        method: "item/tool/call",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          callId: "call-echo-1",
-          namespace: null,
-          tool: "echo",
-          arguments: {},
-        },
-      }),
-    ).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "echo done" }],
-    });
-    await harness.notify({
-      method: "item/completed",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        completedAtMs: Date.now(),
-        item: {
-          type: "dynamicToolCall",
-          id: "call-echo-1",
-          namespace: null,
-          tool: "echo",
-          arguments: {},
-          status: "completed",
-          contentItems: [{ type: "inputText", text: "echo done" }],
-          success: true,
-          durationMs: 1,
-        },
-      },
-    });
-    await expect(
-      harness.handleServerRequest({
-        id: "request-image-generate",
-        method: "item/tool/call",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          callId: "call-image-1",
-          namespace: null,
-          tool: "image_generate",
-          arguments: { prompt: "lighthouse" },
-        },
-      }),
-    ).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "Background task started." }],
-    });
-
-    const result = await run;
-    expect(result.timedOut).toBe(false);
+  it("keeps mixed dynamic tool batches running after one terminal result", () => {
     expect(
-      harness.requests.some(
-        (request) =>
-          request.method === "turn/interrupt" &&
-          (request.params as { turnId?: string } | undefined)?.turnId === "turn-1",
-      ),
-    ).toBe(true);
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 1,
+        activeTurnItemIdsCount: 0,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("wait");
+    expect(
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 0,
+        pendingOpenClawDynamicToolCompletionIdsCount: 1,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("wait");
+    expect(
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 1,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("wait");
   });
 
-  it("waits for active native items before terminal dynamic tool release", async () => {
-    const harness = createStartedThreadHarness();
-    testing.setOpenClawCodingToolsFactoryForTests(() => [
-      {
-        ...createRuntimeDynamicTool("image_generate"),
-        execute: vi.fn(async () => ({
-          content: [{ type: "text" as const, text: "Background task started." }],
-          details: { async: true, status: "started", taskId: "task-1" },
-          terminate: true,
-        })),
-      },
-    ]);
-
-    const params = createParams(
-      path.join(tempDir, "session.jsonl"),
-      path.join(tempDir, "workspace"),
-    );
-    params.disableTools = false;
-    params.runtimePlan = createCodexRuntimePlanFixture();
-
-    const run = runCodexAppServerAttempt(params);
-    await harness.waitForMethod("turn/start");
-    await harness.notify({
-      method: "item/started",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        item: { type: "commandExecution", id: "cmd-1", status: "inProgress" },
-      },
-    });
-
-    await expect(
-      harness.handleServerRequest({
-        id: "request-image-generate",
-        method: "item/tool/call",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          callId: "call-image-1",
-          namespace: null,
-          tool: "image_generate",
-          arguments: { prompt: "lighthouse" },
-        },
-      }),
-    ).resolves.toEqual({
-      success: true,
-      contentItems: [{ type: "inputText", text: "Background task started." }],
-    });
-    expect(harness.requests.some((request) => request.method === "turn/interrupt")).toBe(false);
-
-    await harness.notify({
-      method: "item/completed",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        item: { type: "commandExecution", id: "cmd-1", status: "completed" },
-      },
-    });
-
-    const result = await run;
-    expect(result.timedOut).toBe(false);
+  it("does not terminal-release when a parallel non-terminal dynamic tool finished first", () => {
     expect(
-      harness.requests.some(
-        (request) =>
-          request.method === "turn/interrupt" &&
-          (request.params as { turnId?: string } | undefined)?.turnId === "turn-1",
-      ),
-    ).toBe(true);
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 0,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: true,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("clear-nonterminal-batch");
+  });
+
+  it("terminal-releases after a prior non-terminal dynamic tool batch is closed", () => {
+    expect(
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 0,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("release-pending-terminal");
+  });
+
+  it("waits for active native items before terminal dynamic tool release", () => {
+    expect(
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 1,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("wait");
+    expect(
+      testing.resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: 0,
+        activeTurnItemIdsCount: 0,
+        pendingOpenClawDynamicToolCompletionIdsCount: 0,
+        currentTurnHadNonTerminalDynamicToolResult: false,
+        hasPendingTerminalDynamicToolRelease: true,
+      }),
+    ).toBe("release-pending-terminal");
   });
 
   it("emits request-boundary terminal diagnostics when a wrapped dynamic tool does not", async () => {
-    const harness = createStartedThreadHarness();
     const diagnosticEvents: DiagnosticEventPayload[] = [];
     const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
       diagnosticEvents.push(event),
     );
-    const rawTool = {
-      name: "echo",
-      description: "echo test tool",
-      parameters: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-      execute: vi.fn(async () => ({
-        content: [{ type: "text" as const, text: "echo done" }],
-        details: {},
-      })),
-    };
-    rawTool.execute.mockImplementationOnce(async () => {
+    try {
+      const call = {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "call-echo-unobserved-terminal",
+        namespace: null,
+        tool: "echo",
+        arguments: {},
+      } satisfies CodexDynamicToolCallParams;
+
+      emitDynamicToolStartedDiagnostic({
+        call,
+        runId: "run-1",
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+      });
       emitTrustedDiagnosticEvent({
         type: "tool.execution.completed",
         runId: "other-run",
@@ -3662,84 +3394,67 @@ describe("runCodexAppServerAttempt", () => {
         toolCallId: "call-echo-unobserved-terminal",
         durationMs: 1,
       });
-      return {
-        content: [{ type: "text" as const, text: "echo done" }],
-        details: {},
-      };
-    });
-    const markedWrappedTool = {
-      ...wrapToolWithBeforeToolCallHook(rawTool as never),
-      execute: rawTool.execute,
-    };
-    testing.setOpenClawCodingToolsFactoryForTests(() => [markedWrappedTool as never]);
+      expect(
+        testing.hasPendingDynamicToolTerminalDiagnostic({
+          call,
+          runId: "run-1",
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+        }),
+      ).toBe(false);
 
-    const params = createParams(
-      path.join(tempDir, "session.jsonl"),
-      path.join(tempDir, "workspace"),
-    );
-    params.disableTools = false;
-    params.runtimePlan = createCodexRuntimePlanFixture();
-
-    const run = runCodexAppServerAttempt(params);
-    await harness.waitForMethod("thread/start");
-
-    const toolResult = (await harness.handleServerRequest({
-      id: "request-echo-unobserved-terminal-tool",
-      method: "item/tool/call",
-      params: {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        callId: "call-echo-unobserved-terminal",
-        namespace: null,
-        tool: "echo",
-        arguments: {},
-      },
-    })) as {
-      contentItems?: Array<{ text?: string; type?: string }>;
-      success?: boolean;
-    };
-    expect(toolResult.success).toBe(true);
-
-    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    await run;
-    await flushDiagnosticEvents();
-    unsubscribeDiagnostics();
-
-    const toolDiagnosticEvents = diagnosticEvents.filter(
-      (
-        event,
-      ): event is Extract<
-        DiagnosticEventPayload,
-        { type: "tool.execution.started" | "tool.execution.completed" | "tool.execution.error" }
-      > => event.type.startsWith("tool.execution."),
-    );
-    expect(
-      toolDiagnosticEvents.map((event) => ({
-        runId: event.runId,
-        type: event.type,
-        toolName: event.toolName,
-        toolCallId: event.toolCallId,
-      })),
-    ).toEqual([
-      {
+      emitDynamicToolTerminalDiagnostic({
+        call,
         runId: "run-1",
-        type: "tool.execution.started",
-        toolName: "echo",
-        toolCallId: "call-echo-unobserved-terminal",
-      },
-      {
-        runId: "other-run",
-        type: "tool.execution.completed",
-        toolName: "echo",
-        toolCallId: "call-echo-unobserved-terminal",
-      },
-      {
-        runId: "run-1",
-        type: "tool.execution.completed",
-        toolName: "echo",
-        toolCallId: "call-echo-unobserved-terminal",
-      },
-    ]);
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        durationMs: 1,
+        response: {
+          success: true,
+          contentItems: [{ type: "inputText", text: "echo done" }],
+        },
+      });
+
+      await flushDiagnosticEvents();
+
+      const toolDiagnosticEvents = diagnosticEvents.filter(
+        (
+          event,
+        ): event is Extract<
+          DiagnosticEventPayload,
+          { type: "tool.execution.started" | "tool.execution.completed" | "tool.execution.error" }
+        > => event.type.startsWith("tool.execution."),
+      );
+      expect(
+        toolDiagnosticEvents.map((event) => ({
+          runId: event.runId,
+          type: event.type,
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+        })),
+      ).toEqual([
+        {
+          runId: "run-1",
+          type: "tool.execution.started",
+          toolName: "echo",
+          toolCallId: "call-echo-unobserved-terminal",
+        },
+        {
+          runId: "other-run",
+          type: "tool.execution.completed",
+          toolName: "echo",
+          toolCallId: "call-echo-unobserved-terminal",
+        },
+        {
+          runId: "run-1",
+          type: "tool.execution.completed",
+          toolName: "echo",
+          toolCallId: "call-echo-unobserved-terminal",
+        },
+      ]);
+    } finally {
+      unsubscribeDiagnostics();
+    }
   });
 
   it("does not duplicate terminal diagnostics for wrapped dynamic tool blocks", async () => {
