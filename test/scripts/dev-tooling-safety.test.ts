@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { testing as promptProbeTesting } from "../../scripts/anthropic-prompt-probe.ts";
 import { testing as claudeUsageTesting } from "../../scripts/debug-claude-usage.ts";
 import { testing as discordSmokeTesting } from "../../scripts/dev/discord-acp-plain-language-smoke.ts";
+import { testing as realtimeSmokeTesting } from "../../scripts/dev/realtime-talk-live-smoke.ts";
 import {
   maskIdentifier,
   parseBooleanEnv,
@@ -143,6 +144,46 @@ describe("script-specific dev tooling hardening", () => {
     expect(calls).toBe(1);
   });
 
+  it("aborts stalled OpenAI realtime smoke fetches at the request timeout", async () => {
+    let signal: AbortSignal | undefined;
+    const request = realtimeSmokeTesting.createOpenAIClientSecret("test-key", {
+      timeoutMs: 5,
+      fetchImpl: ((_url, init) => {
+        signal = init?.signal ?? undefined;
+        return new Promise(() => {});
+      }) as typeof fetch,
+    });
+
+    await expect(request).rejects.toThrow(
+      /OpenAI Realtime client secret request exceeded timeout/u,
+    );
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("times out stalled OpenAI realtime smoke response body reads", async () => {
+    const response = {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: () => new Promise(() => {}),
+    } as Response;
+    const request = realtimeSmokeTesting.createOpenAIClientSecret("test-key", {
+      timeoutMs: 5,
+      fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
+    });
+
+    await expect(request).rejects.toThrow(
+      /OpenAI Realtime client secret request exceeded timeout/u,
+    );
+  });
+
+  it("rejects invalid OpenAI realtime smoke timeout values", () => {
+    expect(realtimeSmokeTesting.resolveOpenAIHttpTimeoutMs("42")).toBe(42);
+    expect(() => realtimeSmokeTesting.resolveOpenAIHttpTimeoutMs("2s")).toThrow(
+      /OPENCLAW_REALTIME_OPENAI_HTTP_TIMEOUT_MS must be an integer/u,
+    );
+  });
+
   it("rejects absolute-form URLs in the Anthropic capture proxy", () => {
     expect(
       promptProbeTesting.resolveAnthropicUpstreamUrl(
@@ -162,5 +203,41 @@ describe("script-specific dev tooling hardening", () => {
     expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).toContain("host_key = 'claude.ai'");
     expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).toContain("LIKE '%.claude.ai'");
     expect(claudeUsageTesting.CLAUDE_COOKIE_HOST_SQL).not.toContain("%claude.ai%");
+  });
+
+  it("aborts stalled Claude usage fetches at the request timeout", async () => {
+    let signal: AbortSignal | undefined;
+    const request = claudeUsageTesting.fetchAnthropicOAuthUsage("test-token", {
+      timeoutMs: 5,
+      fetchImpl: ((_url, init) => {
+        signal = init?.signal ?? undefined;
+        return new Promise(() => {});
+      }) as typeof fetch,
+    });
+
+    await expect(request).rejects.toThrow(/Anthropic OAuth usage request exceeded timeout/u);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("times out stalled Claude usage response body reads", async () => {
+    const response = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "application/json" }),
+      text: () => new Promise(() => {}),
+    } as Response;
+    const request = claudeUsageTesting.fetchAnthropicOAuthUsage("test-token", {
+      timeoutMs: 5,
+      fetchImpl: (() => Promise.resolve(response)) as typeof fetch,
+    });
+
+    await expect(request).rejects.toThrow(/Anthropic OAuth usage request exceeded timeout/u);
+  });
+
+  it("rejects invalid Claude usage timeout values", () => {
+    expect(claudeUsageTesting.resolveFetchTimeoutMs("123")).toBe(123);
+    expect(() => claudeUsageTesting.resolveFetchTimeoutMs("1.5")).toThrow(
+      /OPENCLAW_DEBUG_CLAUDE_USAGE_FETCH_TIMEOUT_MS must be an integer/u,
+    );
   });
 });
