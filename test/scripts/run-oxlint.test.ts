@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   createOxlintShards,
+  filterOxlintShards,
+  parseShardRunnerArgs,
   createWindowsExtensionShards,
   resolveWindowsExtensionChunkSize,
   shouldRunOxlintShardsSerial,
@@ -33,6 +35,9 @@ describe("run-oxlint", () => {
 
     expect(packageJson.scripts.check).toBe("node scripts/check.mjs");
     expect(packageJson.scripts.lint).toBe("node scripts/run-oxlint-shards.mjs");
+    expect(packageJson.scripts["lint:core"]).toBe(
+      "node scripts/run-oxlint-shards.mjs --only=core --split-core",
+    );
     expect(packageJson.scripts.check).not.toContain(
       "node scripts/prepare-extension-package-boundary-artifacts.mjs",
     );
@@ -165,6 +170,68 @@ describe("run-oxlint", () => {
         name: "scripts",
         args: ["--tsconfig", "config/tsconfig/oxlint.scripts.json", "scripts"],
       },
+    ]);
+  });
+
+  it("splits core oxlint shards when requested", () => {
+    const shards = createOxlintShards({
+      cwd: "/repo",
+      splitCore: true,
+      readDir: (target: string) => {
+        if (target.endsWith("/src")) {
+          return [
+            { name: "zeta.ts", isDirectory: () => false, isFile: () => true },
+            { name: "omega.ts", isDirectory: () => false, isFile: () => true },
+            { name: "notes.md", isDirectory: () => false, isFile: () => true },
+            { name: "alpha", isDirectory: () => true, isFile: () => false },
+          ] as never;
+        }
+        return [];
+      },
+    });
+
+    expect(shards.slice(0, 4)).toEqual([
+      {
+        name: "core:src:alpha",
+        args: ["--tsconfig", "config/tsconfig/oxlint.core.json", "src/alpha"],
+      },
+      {
+        name: "core:src:root",
+        args: ["--tsconfig", "config/tsconfig/oxlint.core.json", "src/omega.ts", "src/zeta.ts"],
+      },
+      {
+        name: "core:ui",
+        args: ["--tsconfig", "config/tsconfig/oxlint.core.json", "ui"],
+      },
+      {
+        name: "core:packages",
+        args: ["--tsconfig", "config/tsconfig/oxlint.core.json", "packages"],
+      },
+    ]);
+  });
+
+  it("parses shard runner flags without forwarding them to oxlint", () => {
+    const parsed = parseShardRunnerArgs(["--only=core", "--split-core", "--max-warnings", "0"]);
+
+    expect([...parsed.only]).toEqual(["core"]);
+    expect(parsed.splitCore).toBe(true);
+    expect(parsed.oxlintArgs).toEqual(["--max-warnings", "0"]);
+  });
+
+  it("filters split core shards by shard family", () => {
+    const shards = filterOxlintShards(
+      createOxlintShards({
+        cwd: "/repo",
+        splitCore: true,
+        readDir: () => [{ name: "alpha", isDirectory: () => true, isFile: () => false }] as never,
+      }),
+      new Set(["core"]),
+    );
+
+    expect(shards.map((shard) => shard.name)).toEqual([
+      "core:src:alpha",
+      "core:ui",
+      "core:packages",
     ]);
   });
 

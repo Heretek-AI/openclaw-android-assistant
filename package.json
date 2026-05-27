@@ -85,6 +85,7 @@
     "!dist/extensions/nextcloud-talk/**",
     "!dist/extensions/nostr/**",
     "!dist/extensions/qqbot/**",
+    "!dist/extensions/pixverse/**",
     "!dist/extensions/qa-channel/**",
     "!dist/extensions/qa-lab/**",
     "!dist/extensions/qa-matrix/**",
@@ -848,6 +849,10 @@
       "types": "./dist/plugin-sdk/channel-message-runtime.d.ts",
       "default": "./dist/plugin-sdk/channel-message-runtime.js"
     },
+    "./plugin-sdk/channel-outbound": {
+      "types": "./dist/plugin-sdk/channel-outbound.d.ts",
+      "default": "./dist/plugin-sdk/channel-outbound.js"
+    },
     "./plugin-sdk/channel-pairing": {
       "types": "./dist/plugin-sdk/channel-pairing.d.ts",
       "default": "./dist/plugin-sdk/channel-pairing.js"
@@ -1482,7 +1487,7 @@
     "lint:apps": "pnpm lint:swift",
     "lint:auth:no-pairing-store-group": "node scripts/check-no-pairing-store-group-auth.mjs",
     "lint:auth:pairing-account-scope": "node scripts/check-pairing-account-scope.mjs",
-    "lint:core": "node scripts/run-oxlint.mjs --tsconfig config/tsconfig/oxlint.core.json src ui packages",
+    "lint:core": "node scripts/run-oxlint-shards.mjs --only=core --split-core",
     "lint:docker-e2e": "node scripts/check-docker-e2e-boundaries.mjs",
     "lint:docs": "pnpm dlx --config.resolution-mode=highest markdownlint-cli2 --config config/markdownlint-cli2.jsonc",
     "lint:docs:fix": "pnpm dlx --config.resolution-mode=highest markdownlint-cli2 --config config/markdownlint-cli2.jsonc --fix",
@@ -1704,7 +1709,7 @@
     "test:install:e2e:openai": "OPENCLAW_E2E_MODELS=openai bash scripts/test-install-sh-e2e-docker.sh",
     "test:install:smoke": "bash scripts/test-install-sh-docker.sh",
     "test:live": "node scripts/test-live.mjs",
-    "test:live:cache": "node --import tsx scripts/check-live-cache.ts",
+    "test:live:cache": "node scripts/run-with-env.mjs OPENCLAW_LIVE_TEST=1 OPENCLAW_LIVE_CACHE_TEST=1 -- node --import tsx scripts/check-live-cache.ts",
     "test:live:codex-harness": "node scripts/test-live.mjs --codex-harness -- src/gateway/gateway-codex-harness.live.test.ts",
     "test:live:crestodian-rescue-channel": "node scripts/run-with-env.mjs OPENCLAW_LIVE_CRESTODIAN_RESCUE_CHANNEL=1 -- node scripts/test-live.mjs -- src/crestodian/rescue-channel.live.test.ts",
     "test:live:gateway-profiles": "node scripts/test-live.mjs -- src/gateway/gateway-models.profiles.live.test.ts",

@@ -47,6 +47,7 @@ type MatrixQaGatewayChild = {
   ) => Promise<void>;
   restart(): Promise<void>;
   runtimeEnv?: NodeJS.ProcessEnv;
+  workspaceDir: string;
 };
 
 const DEFAULT_MATRIX_QA_RUN_TIMEOUT_MS = 30 * 60_000;
@@ -200,8 +201,17 @@ function resolveMatrixQaCanaryTimeoutMs() {
   );
 }
 
-function remainingMatrixQaRunMs(deadline: { deadlineMs: number }) {
-  return Math.max(1, deadline.deadlineMs - Date.now());
+function remainingMatrixQaRunMs(
+  deadline: { deadlineMs: number; timeoutMs: number },
+  label: string,
+) {
+  const remainingMs = Math.floor(deadline.deadlineMs - Date.now());
+  if (!Number.isFinite(deadline.deadlineMs) || remainingMs <= 0) {
+    throw new Error(
+      `${label} not started because Matrix QA run timed out after ${formatMatrixQaDurationMs(deadline.timeoutMs)}`,
+    );
+  }
+  return remainingMs;
 }
 
 async function withMatrixQaTimeout<T>(
@@ -231,7 +241,7 @@ async function withMatrixQaRunDeadline<T>(
   label: string,
   task: () => Promise<T>,
 ) {
-  return await withMatrixQaTimeout(label, remainingMatrixQaRunMs(deadline), task);
+  return await withMatrixQaTimeout(label, remainingMatrixQaRunMs(deadline, label), task);
 }
 
 async function cleanupMatrixQaResource(params: {
@@ -801,6 +811,7 @@ export async function runMatrixQaLive(params: {
                 observerUserId: provisioning.observer.userId,
                 gatewayRuntimeEnv: scenarioGateway.harness.gateway.runtimeEnv,
                 gatewayStateDir: scenarioGateway.harness.gateway.runtimeEnv?.OPENCLAW_STATE_DIR,
+                gatewayWorkspaceDir: scenarioGateway.harness.gateway.workspaceDir,
                 gatewayCall: async (method, params, opts) =>
                   await scenarioGateway.harness.gateway.call(method, params ?? {}, opts),
                 outputDir,
@@ -1135,10 +1146,12 @@ export const testing = {
   findMatrixQaScenarios,
   isMatrixAccountReady,
   patchMatrixQaGatewayConfig,
+  remainingMatrixQaRunMs,
   resolveMatrixQaCanaryTimeoutMs,
   resolveMatrixQaModels,
   shouldWriteMatrixQaProgress,
   summarizeMatrixQaConfigSnapshot,
   waitForMatrixChannelReady,
+  withMatrixQaRunDeadline,
 };
 export { testing as __testing };
