@@ -12,6 +12,7 @@ import {
   emitAgentEvent as emitGlobalAgentEvent,
   finalizeHarnessContextEngineTurn,
   formatErrorMessage,
+  getAgentHarnessHookRunner,
   getBeforeToolCallPolicyDiagnosticState,
   isActiveHarnessContextEngine,
   loadCodexBundleMcpThreadConfig,
@@ -586,6 +587,7 @@ export async function runCodexAppServerAttempt(
     channelId: hookChannelId,
     ...hookContextWindowFields,
   };
+  const hookRunner = getAgentHarnessHookRunner();
   const activeContextEnginePluginId = activeContextEngine
     ? resolveContextEngineOwnerPluginId(activeContextEngine)
     : undefined;
@@ -794,13 +796,18 @@ export async function runCodexAppServerAttempt(
     timeoutMs: params.timeoutMs,
     timeoutFloorMs: options.startupTimeoutFloorMs,
   });
-  try {
-    emitCodexAppServerEvent(params, {
-      stream: "codex_app_server.lifecycle",
-      data: { phase: "startup" },
-    });
+  const buildNativeHookRelayFinalConfigPatch = (
+    decision: { action: "resume"; binding: CodexAppServerThreadBinding } | { action: "start" },
+  ) => {
+    nativeHookRelay?.unregister();
     nativeHookRelay = createCodexNativeHookRelay({
       options: options.nativeHookRelay,
+      generation:
+        decision.action === "resume" ? decision.binding.nativeHookRelayGeneration : undefined,
+      generationMismatchGraceMs:
+        decision.action === "resume" && !decision.binding.nativeHookRelayGeneration
+          ? CODEX_NATIVE_HOOK_RELAY_TTL_GRACE_MS
+          : undefined,
       events: nativeHookRelayEvents,
       agentId: sessionAgentId,
       sessionId: params.sessionId,
@@ -813,15 +820,24 @@ export async function runCodexAppServerAttempt(
       turnStartTimeoutMs: params.timeoutMs,
       signal: runAbortController.signal,
     });
-    const nativeHookRelayConfig = nativeHookRelay
-      ? buildCodexNativeHookRelayConfig({
-          relay: nativeHookRelay,
-          events: nativeHookRelayEvents,
-          hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
-        })
-      : options.nativeHookRelay?.enabled === false
-        ? buildCodexNativeHookRelayDisabledConfig()
-        : undefined;
+    return {
+      configPatch: nativeHookRelay
+        ? buildCodexNativeHookRelayConfig({
+            relay: nativeHookRelay,
+            events: nativeHookRelayEvents,
+            hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
+          })
+        : options.nativeHookRelay?.enabled === false
+          ? buildCodexNativeHookRelayDisabledConfig()
+          : undefined,
+      nativeHookRelayGeneration: nativeHookRelay?.generation,
+    };
+  };
+  try {
+    emitCodexAppServerEvent(params, {
+      stream: "codex_app_server.lifecycle",
+      data: { phase: "startup" },
+    });
     const startupResult = await startCodexAttemptThread({
       attemptClientFactory,
       appServer,
@@ -837,7 +853,7 @@ export async function runCodexAppServerAttempt(
       effectiveWorkspace,
       dynamicTools: toolBridge.specs,
       developerInstructions: promptBuild.developerInstructions,
-      finalConfigPatch: nativeHookRelayConfig,
+      buildFinalConfigPatch: buildNativeHookRelayFinalConfigPatch,
       bundleMcpThreadConfig,
       nativeToolSurfaceEnabled,
       sandboxExecServerEnabled,
@@ -848,6 +864,7 @@ export async function runCodexAppServerAttempt(
       onStartupTimeout: () => {
         runAbortController.abort("codex_startup_timeout");
       },
+      spawnedBy: params.spawnedBy,
     });
     client = startupResult.client;
     thread = startupResult.thread;
@@ -1566,6 +1583,7 @@ export async function runCodexAppServerAttempt(
     runAgentHarnessLlmInputHook({
       event: buildLlmInputEvent(),
       ctx: hookContext,
+      hookRunner,
     });
     emitCodexAppServerEvent(params, {
       stream: "codex_app_server.lifecycle",
@@ -1655,6 +1673,7 @@ export async function runCodexAppServerAttempt(
           assistantTexts: [],
         },
         ctx: hookContext,
+        hookRunner,
       });
       const turnStartFailureKind = classifyCodexModelCallFailureKind({
         error: turnStartError,
@@ -1677,6 +1696,7 @@ export async function runCodexAppServerAttempt(
           durationMs: Date.now() - attemptStartedAt,
         },
         ctx: hookContext,
+        hookRunner,
       });
       if (!timedOut) {
         await unsubscribeCodexThreadBestEffort(client, {
@@ -2011,6 +2031,7 @@ export async function runCodexAppServerAttempt(
         ...(result.attemptUsage ? { usage: result.attemptUsage } : {}),
       },
       ctx: hookContext,
+      hookRunner,
     });
     await runCodexAgentEndHook(params, {
       event: {
@@ -2020,6 +2041,7 @@ export async function runCodexAppServerAttempt(
         durationMs: Date.now() - attemptStartedAt,
       },
       ctx: hookContext,
+      hookRunner,
     });
     const completedTurnStatus = activeProjector.getCompletedTurnStatus();
     shouldDelayNativeHookRelayUnregister =
