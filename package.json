@@ -1,6 +1,6 @@
 {
   "name": "openclaw",
-  "version": "2026.5.27",
+  "version": "2026.5.28",
   "description": "Multi-channel AI gateway with extensible messaging integrations",
   "keywords": [],
   "homepage": "https://github.com/openclaw/openclaw#readme",
@@ -51,6 +51,8 @@
     "!dist/plugin-sdk/provider-http-test-mocks.d.ts",
     "!dist/plugin-sdk/provider-test-contracts.js",
     "!dist/plugin-sdk/provider-test-contracts.d.ts",
+    "!dist/plugin-sdk/reply-payload-testing.js",
+    "!dist/plugin-sdk/reply-payload-testing.d.ts",
     "!dist/plugin-sdk/test-env.js",
     "!dist/plugin-sdk/test-env.d.ts",
     "!dist/plugin-sdk/test-fixtures.js",
