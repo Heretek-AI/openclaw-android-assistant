@@ -110,6 +110,13 @@ export function timestampMsToIsoString(value: unknown): string | undefined {
   return timestampMs === undefined ? undefined : new Date(timestampMs).toISOString();
 }
 
+export function resolveDateTimestampMs(
+  value: unknown,
+  fallbackValue: unknown = Date.now(),
+): number {
+  return asDateTimestampMs(value) ?? asDateTimestampMs(fallbackValue) ?? 0;
+}
+
 export function resolveTimestampMsToIsoString(
   value: unknown,
   fallbackValue: unknown = Date.now(),
@@ -241,21 +248,40 @@ export function nonNegativeSecondsToSafeMilliseconds(value: unknown): number | u
   return Number.isSafeInteger(milliseconds) ? milliseconds : undefined;
 }
 
+export function resolveExpiresAtMsFromDurationMs(
+  value: unknown,
+  opts: { nowMs?: number; bufferMs?: number; minRemainingMs?: number } = {},
+): number | undefined {
+  const durationMs = asPositiveSafeInteger(value);
+  if (durationMs === undefined) {
+    return undefined;
+  }
+  const nowMs = asDateTimestampMs(opts.nowMs ?? Date.now());
+  const bufferMs = asFiniteNumber(opts.bufferMs ?? 0);
+  if (nowMs === undefined || bufferMs === undefined) {
+    return undefined;
+  }
+  const expiresAt = nowMs + durationMs - bufferMs;
+  if (!Number.isSafeInteger(expiresAt) || timestampMsToIsoString(expiresAt) === undefined) {
+    return undefined;
+  }
+  const minRemainingMs = opts.minRemainingMs;
+  if (minRemainingMs === undefined) {
+    return expiresAt;
+  }
+  const minExpiresAt = nowMs + minRemainingMs;
+  if (!Number.isSafeInteger(minExpiresAt) || timestampMsToIsoString(minExpiresAt) === undefined) {
+    return expiresAt;
+  }
+  return Math.max(expiresAt, minExpiresAt);
+}
+
 export function resolveExpiresAtMsFromDurationSeconds(
   value: unknown,
   opts: { nowMs?: number; bufferMs?: number; minRemainingMs?: number } = {},
 ): number | undefined {
   const durationMs = positiveSecondsToSafeMilliseconds(value);
-  if (durationMs === undefined) {
-    return undefined;
-  }
-  const nowMs = opts.nowMs ?? Date.now();
-  const expiresAt = nowMs + durationMs - (opts.bufferMs ?? 0);
-  if (!Number.isSafeInteger(expiresAt)) {
-    return undefined;
-  }
-  const minRemainingMs = opts.minRemainingMs;
-  return minRemainingMs === undefined ? expiresAt : Math.max(expiresAt, nowMs + minRemainingMs);
+  return durationMs === undefined ? undefined : resolveExpiresAtMsFromDurationMs(durationMs, opts);
 }
 
 export function resolveExpiresAtMsFromEpochSeconds(
