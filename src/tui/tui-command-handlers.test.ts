@@ -15,6 +15,9 @@ type SelectableOverlay = {
 };
 type SetActivityStatusMock = ReturnType<typeof vi.fn> & ((text: string) => void);
 type SetSessionMock = ReturnType<typeof vi.fn> & ((key: string) => Promise<void>);
+type SetEmptySessionMock = ReturnType<typeof vi.fn> & ((key: string) => Promise<void>);
+type ConsumeCompletedRunMock = ReturnType<typeof vi.fn> & ((runId: string) => boolean);
+type FlushPendingHistoryRefreshMock = ReturnType<typeof vi.fn> & (() => void);
 
 async function flushAsyncSelect() {
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -67,9 +70,11 @@ function createHarness(params?: {
   runGoalCommand?: ReturnType<typeof vi.fn>;
   runAuthFlow?: RunAuthFlow;
   setSession?: SetSessionMock;
+  setEmptySession?: SetEmptySessionMock;
   loadHistory?: LoadHistoryMock;
   refreshSessionInfo?: ReturnType<typeof vi.fn>;
   applySessionInfoFromPatch?: ReturnType<typeof vi.fn>;
+  applySessionMutationResult?: ReturnType<typeof vi.fn>;
   setActivityStatus?: SetActivityStatusMock;
   isConnected?: boolean;
   activeChatRunId?: string | null;
@@ -81,6 +86,8 @@ function createHarness(params?: {
   currentAgentId?: string;
   currentSessionKey?: string;
   abortActive?: AbortActiveMock;
+  consumeCompletedRunForPendingSend?: ConsumeCompletedRunMock;
+  flushPendingHistoryRefreshIfIdle?: FlushPendingHistoryRefreshMock;
 }) {
   const sendChat = params?.sendChat ?? vi.fn().mockResolvedValue({ runId: "r1" });
   const getGatewayStatus = params?.getGatewayStatus ?? vi.fn().mockResolvedValue({});
@@ -90,6 +97,8 @@ function createHarness(params?: {
   const resetSession = params?.resetSession ?? vi.fn().mockResolvedValue({ ok: true });
   const runGoalCommand = params?.runGoalCommand ?? vi.fn().mockResolvedValue({ text: "Goal" });
   const setSession = params?.setSession ?? (vi.fn().mockResolvedValue(undefined) as SetSessionMock);
+  const setEmptySession =
+    params?.setEmptySession ?? (vi.fn().mockResolvedValue(undefined) as SetEmptySessionMock);
   const addUser = vi.fn();
   const addSystem = vi.fn();
   const reserveAssistantSlot = vi.fn();
@@ -100,7 +109,9 @@ function createHarness(params?: {
     params?.loadHistory ?? (vi.fn().mockResolvedValue(undefined) as LoadHistoryMock);
   const refreshSessionInfo = params?.refreshSessionInfo ?? vi.fn().mockResolvedValue(undefined);
   const applySessionInfoFromPatch = params?.applySessionInfoFromPatch ?? vi.fn();
+  const applySessionMutationResult = params?.applySessionMutationResult ?? vi.fn();
   const setActivityStatus = params?.setActivityStatus ?? (vi.fn() as SetActivityStatusMock);
+  const forgetLocalRunId = vi.fn();
   const openOverlay = vi.fn();
   const closeOverlay = vi.fn();
   const requestExit = vi.fn();
@@ -143,15 +154,19 @@ function createHarness(params?: {
     refreshSessionInfo: refreshSessionInfo as never,
     loadHistory,
     setSession,
+    setEmptySession,
     refreshAgents: vi.fn(),
     abortActive,
     setActivityStatus,
     formatSessionKey: vi.fn(),
     applySessionInfoFromPatch: applySessionInfoFromPatch as never,
+    applySessionMutationResult: applySessionMutationResult as never,
     noteLocalRunId,
     noteLocalBtwRunId,
-    forgetLocalRunId: vi.fn(),
+    forgetLocalRunId,
     forgetLocalBtwRunId: vi.fn(),
+    consumeCompletedRunForPendingSend: params?.consumeCompletedRunForPendingSend,
+    flushPendingHistoryRefreshIfIdle: params?.flushPendingHistoryRefreshIfIdle,
     runAuthFlow,
     requestExit,
   });
@@ -169,6 +184,7 @@ function createHarness(params?: {
     resetSession,
     runGoalCommand,
     setSession,
+    setEmptySession,
     addUser,
     addSystem,
     reserveAssistantSlot,
@@ -176,10 +192,12 @@ function createHarness(params?: {
     loadHistory,
     refreshSessionInfo,
     applySessionInfoFromPatch,
+    applySessionMutationResult,
     runAuthFlow,
     setActivityStatus,
     noteLocalRunId,
     noteLocalBtwRunId,
+    forgetLocalRunId,
     requestExit,
     abortActive,
     state,
@@ -508,18 +526,21 @@ describe("tui command handlers", () => {
     expect(addSystem).toHaveBeenCalledWith("agent set to work; use /crestodian to return");
   });
 
-  it("defers local run binding until gateway events provide a real run id", async () => {
-    const { handleCommand, noteLocalRunId, state } = createHarness();
+  it("marks the generated runId as local before gateway events arrive", async () => {
+    const { handleCommand, sendChat, noteLocalRunId, state } = createHarness();
 
     await handleCommand("/context detail");
 
-    expect(noteLocalRunId).not.toHaveBeenCalled();
+    const sentRunId = (firstMockArg(sendChat, "sendChat") as { runId: string }).runId;
+    expect(noteLocalRunId).toHaveBeenCalledWith(sentRunId);
     expect(state.activeChatRunId).toBeNull();
     expect(state.pendingOptimisticUserMessage).toBe(true);
   });
 
   it("tracks the in-flight runId so escape can abort during the wait", async () => {
-    const sendChat = vi.fn().mockResolvedValue({ runId: "ignored" });
+    const sendChat = vi.fn().mockImplementation(async (opts: { runId: string }) => ({
+      runId: opts.runId,
+    }));
     const { handleCommand, state } = createHarness({ sendChat });
 
     await handleCommand("hello");
@@ -529,6 +550,55 @@ describe("tui command handlers", () => {
     expect(sentRunId.length).toBeGreaterThan(0);
     expect(state.activeChatRunId).toBeNull();
     expect(state.pendingChatRunId).toBe(sentRunId);
+  });
+
+  it("does not reintroduce the pending runId when an early event already consumed it", async () => {
+    const sendChat = vi.fn();
+    const { handleCommand, state } = createHarness({ sendChat });
+    sendChat.mockImplementation(async (opts: { runId: string }) => {
+      state.pendingOptimisticUserMessage = false;
+      return { runId: opts.runId };
+    });
+
+    await handleCommand("hello");
+
+    expect(state.pendingChatRunId).toBeNull();
+    expect(state.pendingOptimisticUserMessage).toBe(false);
+  });
+
+  it("tracks the backend-accepted runId when it differs from the generated runId", async () => {
+    const sendChat = vi.fn().mockResolvedValue({ runId: "run-accepted" });
+    const { handleCommand, state, noteLocalRunId, forgetLocalRunId } = createHarness({ sendChat });
+
+    await handleCommand("hello");
+
+    const sentRunId = (firstMockArg(sendChat, "sendChat") as { runId: string }).runId;
+    expect(state.pendingChatRunId).toBe("run-accepted");
+    expect(forgetLocalRunId).toHaveBeenCalledWith(sentRunId);
+    expect(noteLocalRunId).toHaveBeenCalledWith("run-accepted");
+  });
+
+  it("does not reintroduce a backend-accepted runId after an early terminal event", async () => {
+    const sendChat = vi.fn().mockResolvedValue({ runId: "run-accepted" });
+    const consumeCompletedRunForPendingSend = vi.fn((runId: string) => runId === "run-accepted");
+    const flushPendingHistoryRefreshIfIdle = vi.fn();
+    const { handleCommand, state, noteLocalRunId, forgetLocalRunId, setActivityStatus } =
+      createHarness({
+        sendChat,
+        consumeCompletedRunForPendingSend,
+        flushPendingHistoryRefreshIfIdle,
+      });
+
+    await handleCommand("hello");
+
+    const sentRunId = (firstMockArg(sendChat, "sendChat") as { runId: string }).runId;
+    expect(consumeCompletedRunForPendingSend).toHaveBeenCalledWith("run-accepted");
+    expect(forgetLocalRunId).toHaveBeenCalledWith(sentRunId);
+    expect(noteLocalRunId).not.toHaveBeenCalledWith("run-accepted");
+    expect(state.pendingChatRunId).toBeNull();
+    expect(state.pendingOptimisticUserMessage).toBe(false);
+    expect(setActivityStatus).toHaveBeenCalledWith("idle");
+    expect(flushPendingHistoryRefreshIfIdle).toHaveBeenCalledTimes(1);
   });
 
   it("clears the pending runId if sendChat fails", async () => {
@@ -578,17 +648,32 @@ describe("tui command handlers", () => {
   it("creates unique session for /new and resets shared session for /reset", async () => {
     const loadHistory = vi.fn().mockResolvedValue(undefined);
     const setSessionMock = vi.fn().mockResolvedValue(undefined) as SetSessionMock;
+    const setEmptySessionMock = vi.fn().mockResolvedValue(undefined) as SetEmptySessionMock;
+    const applySessionMutationResult = vi.fn().mockReturnValue(true);
+    const refreshSessionInfo = vi.fn().mockResolvedValue(undefined);
+    const resetResult = {
+      ok: true as const,
+      key: "agent:main:main",
+      entry: { sessionId: "reset-session" },
+    };
     const { handleCommand, resetSession } = createHarness({
       loadHistory,
       setSession: setSessionMock,
+      setEmptySession: setEmptySessionMock,
+      applySessionMutationResult,
+      refreshSessionInfo,
+      resetSession: vi.fn().mockResolvedValue(resetResult),
     });
 
     await handleCommand("/new");
     await handleCommand("/reset");
 
     // /new creates a unique session key (isolates TUI client) (#39217)
-    expect(setSessionMock).toHaveBeenCalledTimes(1);
-    const newSessionKey = firstMockArg(setSessionMock, "setSession") as string | undefined;
+    expect(setSessionMock).not.toHaveBeenCalled();
+    expect(setEmptySessionMock).toHaveBeenCalledTimes(1);
+    const newSessionKey = firstMockArg(setEmptySessionMock, "setEmptySession") as
+      | string
+      | undefined;
     if (!newSessionKey) {
       throw new Error("expected /new to set a TUI session key");
     }
@@ -599,7 +684,24 @@ describe("tui command handlers", () => {
     // /reset still resets the shared session
     expect(resetSession).toHaveBeenCalledTimes(1);
     expect(resetSession).toHaveBeenCalledWith("agent:main:main", "reset", undefined);
-    expect(loadHistory).toHaveBeenCalledTimes(1); // /reset calls loadHistory directly; /new does so indirectly via setSession
+    expect(applySessionMutationResult).toHaveBeenCalledWith(resetResult);
+    expect(refreshSessionInfo).toHaveBeenCalledTimes(1);
+    expect(loadHistory).not.toHaveBeenCalled();
+  });
+
+  it("reloads history after /reset when the backend does not return a session entry", async () => {
+    const loadHistory = vi.fn().mockResolvedValue(undefined);
+    const applySessionMutationResult = vi.fn().mockReturnValue(false);
+    const { handleCommand } = createHarness({
+      loadHistory,
+      applySessionMutationResult,
+      resetSession: vi.fn().mockResolvedValue({ ok: true }),
+    });
+
+    await handleCommand("/reset");
+
+    expect(applySessionMutationResult).toHaveBeenCalledWith({ ok: true });
+    expect(loadHistory).toHaveBeenCalledTimes(1);
   });
 
   it("scopes /reset for the selected global agent", async () => {
@@ -645,10 +747,10 @@ describe("tui command handlers", () => {
   });
 
   it("sanitizes control sequences in /new and /reset failures", async () => {
-    const setSession = vi.fn().mockRejectedValue(new Error("\u001b[31mboom\u001b[0m"));
+    const setEmptySession = vi.fn().mockRejectedValue(new Error("\u001b[31mboom\u001b[0m"));
     const resetSession = vi.fn().mockRejectedValue(new Error("\u001b[31mboom\u001b[0m"));
     const { handleCommand, addSystem } = createHarness({
-      setSession,
+      setEmptySession,
       resetSession,
     });
 

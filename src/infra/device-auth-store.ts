@@ -3,35 +3,18 @@ import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
 import {
   clearDeviceAuthTokenFromStore,
+  coerceDeviceAuthStore,
   type DeviceAuthEntry,
+  type DeviceAuthStore,
   loadDeviceAuthTokenFromStore,
   storeDeviceAuthTokenInStore,
 } from "../shared/device-auth-store.js";
-import type { DeviceAuthStore } from "../shared/device-auth.js";
 import { privateFileStoreSync } from "./private-file-store.js";
 
 const DEVICE_AUTH_FILE = "device-auth.json";
 
 type StoreCacheEntry = { store: DeviceAuthStore | null; mtimeMs: number; size: number };
 const storeReadCache = new Map<string, StoreCacheEntry>();
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function parseDeviceAuthStore(value: unknown): DeviceAuthStore | null {
-  if (!isRecord(value) || value.version !== 1 || typeof value.deviceId !== "string") {
-    return null;
-  }
-  if (!isRecord(value.tokens)) {
-    return null;
-  }
-  return {
-    version: 1,
-    deviceId: value.deviceId,
-    tokens: value.tokens,
-  };
-}
 
 function storeCacheHit(
   cached: StoreCacheEntry | undefined,
@@ -59,12 +42,13 @@ function readStore(filePath: string): DeviceAuthStore | null {
     }
     const cached = storeReadCache.get(filePath);
     if (cached !== undefined && storeCacheHit(cached, stat)) {
+      // Device auth is read during gateway reconnects; cache by file metadata to avoid rereads.
       return cached.store;
     }
     const parsed = privateFileStoreSync(path.dirname(filePath)).readJsonIfExists(
       path.basename(filePath),
     );
-    const store = parseDeviceAuthStore(parsed);
+    const store = coerceDeviceAuthStore(parsed);
     storeReadCache.set(filePath, { store, mtimeMs: stat.mtimeMs, size: stat.size });
     return store;
   } catch {
@@ -84,6 +68,7 @@ function writeStore(filePath: string, store: DeviceAuthStore): void {
   }
 }
 
+/** Load a cached device-auth token from the configured OpenClaw state directory. */
 export function loadDeviceAuthToken(params: {
   deviceId: string;
   role: string;
@@ -97,6 +82,7 @@ export function loadDeviceAuthToken(params: {
   });
 }
 
+/** Persist or replace one device-auth role token in the private state directory. */
 export function storeDeviceAuthToken(params: {
   deviceId: string;
   role: string;
@@ -117,6 +103,7 @@ export function storeDeviceAuthToken(params: {
   });
 }
 
+/** Remove one role token for the current gateway device from the private state directory. */
 export function clearDeviceAuthToken(params: {
   deviceId: string;
   role: string;

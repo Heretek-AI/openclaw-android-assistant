@@ -527,6 +527,109 @@ function hasExplicitRouteParam(params: Record<string, unknown>): boolean {
   );
 }
 
+function hasExplicitTargetParam(params: Record<string, unknown>): boolean {
+  for (const key of ["target", "to", "channelId"]) {
+    if (normalizeOptionalString(params[key])) {
+      return true;
+    }
+  }
+  return (
+    Array.isArray(params.targets) && params.targets.some((value) => normalizeOptionalString(value))
+  );
+}
+
+function isCurrentSourceTargetParam(
+  input: RunMessageActionParams,
+  params: Record<string, unknown>,
+): boolean {
+  const currentChannelId = normalizeOptionalString(input.toolContext?.currentChannelId);
+  if (!currentChannelId) {
+    return false;
+  }
+  const currentChannelProvider = normalizeOptionalLowercaseString(
+    input.toolContext?.currentChannelProvider,
+  );
+  const explicitChannel = normalizeOptionalLowercaseString(params.channel);
+  if (explicitChannel && currentChannelProvider && explicitChannel !== currentChannelProvider) {
+    return false;
+  }
+
+  const explicitTarget =
+    normalizeOptionalString(params.target) ??
+    normalizeOptionalString(params.to) ??
+    normalizeOptionalString(params.channelId);
+  if (!explicitTarget) {
+    return false;
+  }
+
+  const provider = explicitChannel ?? currentChannelProvider;
+  const currentCandidates = new Set<string>();
+  addCandidateAndUnprefixedAlias(currentCandidates, currentChannelId);
+  if (provider) {
+    addCandidateAndUnprefixedAlias(
+      currentCandidates,
+      normalizeTargetForAccountBinding(provider, currentChannelId),
+    );
+  }
+
+  const explicitCandidates = new Set<string>();
+  addCandidateAndUnprefixedAlias(explicitCandidates, explicitTarget);
+  if (provider) {
+    addCandidateAndUnprefixedAlias(
+      explicitCandidates,
+      normalizeTargetForAccountBinding(provider, explicitTarget),
+    );
+  }
+  return Array.from(explicitCandidates).some((candidate) => currentCandidates.has(candidate));
+}
+
+function hasExplicitNonCurrentChannelParam(
+  input: RunMessageActionParams,
+  params: Record<string, unknown>,
+): boolean {
+  const explicitChannel = normalizeOptionalLowercaseString(params.channel);
+  if (!explicitChannel) {
+    return false;
+  }
+  const currentChannelProvider = normalizeOptionalLowercaseString(
+    input.toolContext?.currentChannelProvider,
+  );
+  return !currentChannelProvider || explicitChannel !== currentChannelProvider;
+}
+
+function applyImplicitSourceReplySendPolicy(
+  input: RunMessageActionParams,
+  params: Record<string, unknown>,
+) {
+  if (input.action !== "send" || input.sourceReplyDeliveryMode !== "message_tool_only") {
+    return;
+  }
+  if (hasExplicitNonCurrentChannelParam(input, params)) {
+    return;
+  }
+  if (hasExplicitTargetParam(params) && !isCurrentSourceTargetParam(input, params)) {
+    return;
+  }
+  params.bestEffort = true;
+}
+
+function hasCurrentSourceReplyContext(input: RunMessageActionParams): boolean {
+  const provider = normalizeOptionalLowercaseString(input.toolContext?.currentChannelProvider);
+  if (!provider) {
+    return false;
+  }
+  if (provider === INTERNAL_MESSAGE_CHANNEL) {
+    return true;
+  }
+  const currentMessageId = input.toolContext?.currentMessageId;
+  return Boolean(
+    normalizeOptionalString(input.toolContext?.currentChannelId) ||
+    normalizeOptionalString(input.toolContext?.currentThreadTs) ||
+    (typeof currentMessageId === "number" && Number.isFinite(currentMessageId)) ||
+    normalizeOptionalString(currentMessageId),
+  );
+}
+
 function shouldUseInternalSourceReplySink(
   input: RunMessageActionParams,
   params: Record<string, unknown>,
@@ -534,8 +637,7 @@ function shouldUseInternalSourceReplySink(
   return (
     input.action === "send" &&
     input.sourceReplyDeliveryMode === "message_tool_only" &&
-    normalizeOptionalLowercaseString(input.toolContext?.currentChannelProvider) ===
-      INTERNAL_MESSAGE_CHANNEL &&
+    hasCurrentSourceReplyContext(input) &&
     Boolean(input.sessionKey?.trim()) &&
     !hasExplicitRouteParam(params)
   );
@@ -754,7 +856,7 @@ function buildInternalSourceReplyToolResult(payload: {
     content: [
       {
         type: "text",
-        text: `${action} visible reply to the current webchat conversation${sink}.`,
+        text: `${action} visible reply to the current source conversation${sink}.`,
       },
     ],
     details: {
@@ -1305,6 +1407,7 @@ export async function runMessageAction(
   if (shouldUseInternalSourceReplySink(input, params)) {
     return handleInternalSourceReplySendAction({ ...input, agentId: resolvedAgentId }, params);
   }
+  applyImplicitSourceReplySendPolicy(input, params);
   params = normalizeMessageActionInput({
     action,
     args: params,
