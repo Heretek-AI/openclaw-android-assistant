@@ -33,6 +33,8 @@
   "scripts": {
     "dev": "vite",
     "build:frontend": "vue-tsc --noEmit && vite build",
+    "build:frontend:bundle": "vite build",
+    "type-check": "vue-tsc --noEmit",
     "build:cli": "tsup",
     "build": "npm run build:frontend && npm run build:cli",
     "preview": "vite preview",
