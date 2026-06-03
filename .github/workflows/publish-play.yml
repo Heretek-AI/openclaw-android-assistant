@@ -1,0 +1,209 @@
+name: Publish to Google Play
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "Play Store release track"
+        required: false
+        default: "internal"
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+      format:
+        description: "Artifact format to upload"
+        required: false
+        default: "aab"
+        type: choice
+        options:
+          - aab
+          - apk
+      status:
+        description: "Release status on the chosen track"
+        required: false
+        default: "draft"
+        type: choice
+        options:
+          - draft
+          - completed
+          - inProgress
+          - halted
+      userFraction:
+        description: "Staged rollout fraction (0.0-1.0). Only applies when status=inProgress."
+        required: false
+        default: ""
+        type: string
+      mappingFile:
+        description: "Override mapping.txt path (leave blank to auto-detect from build outputs)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-play
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & upload to Google Play
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.welcome=never"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_FILE }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/keystore
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::ANDROID_KEYSTORE_FILE secret is empty. Add a base64-encoded .jks/.keystore."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/keystore/release.jks
+          chmod 600 /tmp/keystore/release.jks
+          ls -la /tmp/keystore/
+
+      - name: Configure release signing
+        env:
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          GRADLE_USER_HOME="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$GRADLE_USER_HOME"
+          {
+            echo ""
+            echo "# Injected by publish-play.yml — release signing for release builds"
+            echo "OPENCLAW_ANDROID_STORE_FILE=/tmp/keystore/release.jks"
+            echo "OPENCLAW_ANDROID_STORE_PASSWORD=${STORE_PASSWORD}"
+            echo "OPENCLAW_ANDROID_KEY_ALIAS=${KEY_ALIAS}"
+            echo "OPENCLAW_ANDROID_KEY_PASSWORD=${KEY_PASSWORD}"
+          } >> "$GRADLE_USER_HOME/gradle.properties"
+          echo "Wrote release-signing block to $GRADLE_USER_HOME/gradle.properties"
+
+      - name: Build ${{ inputs.format == 'apk' && 'APK' || 'AAB' }} (release)
+        working-directory: android
+        env:
+          FORMAT: ${{ inputs.format }}
+        run: |
+          set -euo pipefail
+          if [ "$FORMAT" = "apk" ]; then
+            ./gradlew :app:assembleRelease \
+              --stacktrace \
+              --warning-mode=all
+          else
+            ./gradlew :app:bundleRelease \
+              --stacktrace \
+              --warning-mode=all
+          fi
+
+      - name: Locate build outputs
+        id: locate
+        working-directory: android
+        env:
+          FORMAT: ${{ inputs.format }}
+          MAPPING_OVERRIDE: ${{ inputs.mappingFile }}
+        run: |
+          set -euo pipefail
+          if [ "$FORMAT" = "apk" ]; then
+            ARTIFACT_GLOB="app/build/outputs/apk/release/*.apk"
+          else
+            ARTIFACT_GLOB="app/build/outputs/bundle/release/*.aab"
+          fi
+          # shellcheck disable=SC2086
+          ARTIFACT=$(ls $ARTIFACT_GLOB | head -1)
+          if [ -z "$ARTIFACT" ] || [ ! -f "$ARTIFACT" ]; then
+            echo "::error::Could not find build output matching $ARTIFACT_GLOB"
+            ls -laR app/build/outputs/ || true
+            exit 1
+          fi
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "Resolved artifact: $ARTIFACT"
+          # mapping.txt is produced for release builds with R8 minify on
+          MAPPING_CANDIDATE="app/build/outputs/mapping/release/mapping.txt"
+          if [ -z "$MAPPING_OVERRIDE" ] && [ -f "$MAPPING_CANDIDATE" ]; then
+            echo "mapping=$MAPPING_CANDIDATE" >> "$GITHUB_OUTPUT"
+            echo "Resolved mapping: $MAPPING_CANDIDATE"
+          elif [ -n "$MAPPING_OVERRIDE" ]; then
+            echo "mapping=$MAPPING_OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "Using override mapping: $MAPPING_OVERRIDE"
+          fi
+
+      - name: Show artifact fingerprint
+        working-directory: android
+        env:
+          ARTIFACT: ${{ steps.locate.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          echo "::group::Artifact details"
+          ls -la "$ARTIFACT"
+          sha256sum "$ARTIFACT"
+          # Read the applicationId/versionName from the merged manifest for a sanity check.
+          if command -v aapt >/dev/null 2>&1; then
+            aapt dump badging "$ARTIFACT" | head -3 || true
+          fi
+          echo "::endgroup::"
+
+      - name: Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: com.codex.mobile
+          releaseFiles: ${{ steps.locate.outputs.artifact }}
+          tracks: ${{ inputs.track }}
+          status: ${{ inputs.status }}
+          userFraction: ${{ inputs.userFraction }}
+          mappingFile: ${{ steps.locate.outputs.mapping }}
+          whatsNewDirectory: .github/play-whatsnew
+          inAppUpdatePriority: 0
+          # Block the action from auto-sending for review so the maintainer can
+          # verify the upload in the Play Console first.
+          changesNotSentForReview: true
+
+      - name: Upload artifact for archival
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-play-${{ inputs.format }}-${{ inputs.track }}
+          path: |
+            android/${{ steps.locate.outputs.artifact }}
+            android/app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  announce:
+    name: Announce upload completion
+    runs-on: ubuntu-latest
+    needs: publish
+    if: success()
+    permissions:
+      contents: read
+    steps:
+      - name: Print next steps
+        run: |
+          echo "✅ Google Play upload completed."
+          echo "Open the workflow run page above to see the chosen track, format, and status."
+          echo "Review the draft in the Play Console and send for review when ready."
