@@ -8,19 +8,40 @@
 #
 # Prerequisites:
 #   - Node.js and npm installed on the build machine
-#   - Run from the android/ directory OR the project root
+#   - The codex-web-local source tree must live at
+#       <project_root>/openclaw-android/
+#     (this is the layout used by the AnyClaw repository).
+#
+# Run from the android/ directory OR the project root.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ANDROID_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECT_ROOT="$(dirname "$ANDROID_DIR")"
+CODEX_WEB_DIR="$PROJECT_ROOT/openclaw-android"
 
 ASSETS_DIR="$ANDROID_DIR/app/src/main/assets/server-bundle"
 
-echo "=== Building codex-web-local ==="
+# codex-web-local hosts the actual build scripts (build:frontend:bundle,
+# build:cli) — the monorepo root does not.
+if [ ! -d "$CODEX_WEB_DIR" ]; then
+    echo "ERROR: codex-web-local source not found at $CODEX_WEB_DIR" >&2
+    echo "       This script expects the codex-web-local tree to be a" >&2
+    echo "       sibling of the android/ directory at the project root." >&2
+    exit 1
+fi
 
-cd "$PROJECT_ROOT"
+if [ ! -f "$CODEX_WEB_DIR/package.json" ]; then
+    echo "ERROR: $CODEX_WEB_DIR/package.json missing — refusing to proceed." >&2
+    exit 1
+fi
+
+echo "=== Building codex-web-local ==="
+echo "Source: $CODEX_WEB_DIR"
+echo "Assets: $ASSETS_DIR"
+
+cd "$CODEX_WEB_DIR"
 
 # Install dependencies if needed
 if [ ! -d "node_modules" ]; then
@@ -30,8 +51,8 @@ fi
 
 # Build frontend (Vue) and CLI (Express server)
 # Use build:frontend:bundle to skip strict type checking so APK bundling
-# isn't blocked by pre-existing source-code type errors. Run `npm run type-check`
-# separately for the same coverage.
+# isn't blocked by pre-existing source-code type errors. Run
+# `npm run type-check` separately for the same coverage.
 echo "Building frontend..."
 npm run build:frontend:bundle
 
@@ -44,15 +65,15 @@ rm -rf "$ASSETS_DIR"
 mkdir -p "$ASSETS_DIR/dist"
 mkdir -p "$ASSETS_DIR/dist-cli"
 
-cp -r "$PROJECT_ROOT/dist/"* "$ASSETS_DIR/dist/"
-cp -r "$PROJECT_ROOT/dist-cli/"* "$ASSETS_DIR/dist-cli/"
-cp "$PROJECT_ROOT/package.json" "$ASSETS_DIR/package.json"
+cp -r "$CODEX_WEB_DIR/dist/"* "$ASSETS_DIR/dist/"
+cp -r "$CODEX_WEB_DIR/dist-cli/"* "$ASSETS_DIR/dist-cli/"
+cp "$CODEX_WEB_DIR/package.json" "$ASSETS_DIR/package.json"
 
 # Install production dependencies into the bundle
 echo "Installing production dependencies for bundle..."
 cd "$ASSETS_DIR"
-npm install --omit=dev --ignore-scripts 2>/dev/null || true
-cd "$PROJECT_ROOT"
+npm install --omit=dev --ignore-scripts --no-audit --no-fund
+cd "$CODEX_WEB_DIR"
 
 echo ""
 echo "=== Server bundle ready ==="
