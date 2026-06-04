@@ -68,19 +68,29 @@ jobs:
 
       - name: Generate changelog
         if: github.ref_type == 'branch'
-        id: changelog
         run: |
+          # Cap to most recent 50 commits so the body stays well under ARG_MAX
+          # when passed to softprops/action-gh-release (which interpolates
+          # 'body:' onto the node process command line).
           PREV_TAG=$(git tag --sort=-v:refname | head -1)
           if [ -n "$PREV_TAG" ]; then
-            CHANGES=$(git log "$PREV_TAG"..HEAD --pretty=format:"- %s" --reverse)
+            git log "$PREV_TAG"..HEAD --pretty=format:"- %s" --reverse -n 50 > /tmp/changes.txt || true
           else
-            CHANGES=$(git log --pretty=format:"- %s" --reverse -20)
+            git log --pretty=format:"- %s" --reverse -n 50 > /tmp/changes.txt || true
           fi
           {
-            echo "notes<<CHANGELOG_EOF"
-            echo "$CHANGES"
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
+            echo "🦞 **AnyClaw** — OpenClaw + Codex on Android"
+            echo ""
+            echo "📱 Install the APK on any ARM64 Android 7.0+ device. No root required."
+            echo ""
+            echo "### Changes"
+            cat /tmp/changes.txt
+            echo ""
+            echo "---"
+            echo "Branch: ${{ github.ref_name }}"
+            echo "Built from commit ${{ github.sha }}"
+          } > /tmp/release-body.md
+          echo "Wrote $(wc -l < /tmp/release-body.md) lines to /tmp/release-body.md"
 
       - name: Create Release
         if: github.ref_type == 'branch'
@@ -88,17 +98,7 @@ jobs:
         with:
           tag_name: v${{ github.run_number }}
           name: "AnyClaw v${{ github.run_number }} (${{ github.ref_name }})"
-          body: |
-            🦞 **AnyClaw** — OpenClaw + Codex on Android
-
-            📱 Install the APK on any ARM64 Android 7.0+ device. No root required.
-
-            ### Changes
-            ${{ steps.changelog.outputs.notes }}
-
-            ---
-            Branch: ${{ github.ref_name }}
-            Built from commit ${{ github.sha }}
+          body_path: /tmp/release-body.md
           files: android/app/build/outputs/apk/debug/anyclaw.apk
           draft: false
           prerelease: false
